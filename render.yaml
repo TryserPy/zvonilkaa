@@ -1,0 +1,20 @@
+# Развёртывание на Render: подключите репозиторий, Render сам найдёт этот файл.
+services:
+  - type: web
+    name: zvonilka
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: "echo 'зависимостей нет, собирать нечего'"
+    startCommand: "node server.js"
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Свой TURN-сервер, если понадобится ретранслятор:
+      # - key: TURN_URL
+      #   value: turn:turn.example.com:3478
+      # - key: TURN_USERNAME
+      #   sync: false
+      # - key: TURN_PASSWORD
+      #   sync: false

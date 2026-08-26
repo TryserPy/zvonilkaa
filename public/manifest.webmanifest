@@ -1,0 +1,18 @@
+{
+  "name": "Звонилка",
+  "short_name": "Звонилка",
+  "description": "Зашифрованные видеозвонки прямо в браузере",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

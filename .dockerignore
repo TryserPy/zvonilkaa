@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+certs
+tools
+*.log
+start.bat
+start.ps1
+README.md
+DEPLOY.md
+Dockerfile
+.dockerignore
+render.yaml

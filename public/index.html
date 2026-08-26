@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Звонилка — зашифрованные звонки в браузере</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="description" content="Видеозвонки прямо в браузере: сквозное шифрование, демонстрация экрана, показ пинга. Без установки и регистрации.">
+<meta name="theme-color" content="#0b0b0d" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="dark light">
+<meta name="mobile-web-app-capable" content="content">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0b0d'/%3E%3Cpath d='M11 9h4l2 4-2.5 1.5a9 9 0 0 0 4 4L20 16l4 2v4c0 1.1-.9 2-2 2A13 13 0 0 1 9 11c0-1.1.9-2 2-2Z' fill='%2340d99a'/%3E%3C/svg%3E">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="preload" href="/app.js" as="script">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- ══════════════════ ЛОББИ ══════════════════ -->
+<main id="lobby" class="screen is-active">
+  <header class="lobby__top">
+    <div class="brand">
+      <svg class="brand__mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h3l1.5 3.5-2 1.2a9.6 9.6 0 0 0 4.3 4.3l1.2-2 3.5 1.5v3a2 2 0 0 1-2 2A13.5 13.5 0 0 1 4.5 5.5a2 2 0 0 1 2-2Z"/></svg>
+      <span>Звонилка</span>
+    </div>
+    <button class="ghost-btn" id="themeToggle" type="button" title="Сменить тему" aria-label="Сменить тему">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
+    </button>
+  </header>
+
+  <div class="lobby__body">
+    <div class="lobby__intro">
+      <div class="pill pill--quiet">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>
+        Сквозное шифрование DTLS-SRTP
+      </div>
+      <h1>Звонок начинается<br>с одной ссылки</h1>
+      <p class="muted">Видео и звук идут напрямую между устройствами. Сервер не может ни услышать, ни записать разговор.</p>
+
+      <div class="actions">
+        <button class="btn btn--primary" id="createBtn" type="button">Создать звонок</button>
+        <form class="join" id="joinForm" autocomplete="off">
+          <input id="roomInput" type="text" inputmode="latin" placeholder="Код комнаты" aria-label="Код комнаты" maxlength="64" spellcheck="false">
+          <button class="btn" type="submit">Войти</button>
+        </form>
+      </div>
+
+    </div>
+
+    <aside class="lobby__preview">
+      <div class="preview">
+        <video id="previewVideo" playsinline autoplay muted></video>
+        <div class="preview__off" id="previewOff">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3.5l6 4.5V6z"/></svg>
+          <span id="previewOffText">Камера выключена</span>
+        </div>
+        <div class="preview__meter" id="previewMeter" aria-hidden="true"><i></i></div>
+      </div>
+      <div class="preview__row">
+        <button class="chip" id="prevMicBtn" type="button" aria-pressed="true">Микрофон</button>
+        <button class="chip" id="prevCamBtn" type="button" aria-pressed="true">Камера</button>
+      </div>
+      <label class="select">
+        <span>Микрофон</span>
+        <select id="micSelect"></select>
+      </label>
+      <label class="select">
+        <span>Камера</span>
+        <select id="camSelect"></select>
+      </label>
+    </aside>
+
+      <ul class="features">
+        <li><b>P2P</b>Прямое соединение, минимальная задержка</li>
+        <li><b>Пинг</b>Задержка и качество канала в реальном времени</li>
+        <li><b>Демо</b>Демонстрация экрана в один клик</li>
+      </ul>
+  </div>
+
+  <footer class="lobby__foot muted">Работает в Chrome, Safari, Firefox и Edge. Без регистрации и установки.</footer>
+</main>
+
+<!-- ══════════════════ ЗВОНОК ══════════════════ -->
+<main id="call" class="screen">
+  <div class="stage" id="stage">
+    <div class="tile tile--remote is-off is-cover" id="remoteTile">
+      <video id="remoteVideo" playsinline autoplay></video>
+      <div class="tile__off" id="remoteOff">
+        <div class="avatar" id="remoteAvatar">?</div>
+        <span id="remoteOffText">Ожидание собеседника…</span>
+      </div>
+      <div class="tile__tag" id="remoteTag" hidden>
+        <svg class="ic-mute" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4l16 16M12 4a3 3 0 0 1 3 3v4M9 9v2a3 3 0 0 0 4.5 2.6M5 11a7 7 0 0 0 10.7 6M12 19v2"/></svg>
+        Микрофон выключен
+      </div>
+    </div>
+
+    <div class="tile tile--local" id="localTile">
+      <video id="localVideo" playsinline autoplay muted></video>
+      <div class="tile__off" id="localOff"><span>Вы</span></div>
+      <button class="tile__flip" id="flipBtn" type="button" title="Другая камера" aria-label="Переключить камеру" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8h13l-3-3M21 16H8l3 3"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Верхняя панель -->
+  <div class="hud hud--top">
+    <div class="pill" id="statusPill">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Подключение…</span>
+    </div>
+    <button class="pill pill--btn" id="pingPill" type="button" title="Показать статистику">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l4-6 4 3 4-8 6 11"/></svg>
+      <span id="pingText">— мс</span>
+    </button>
+    <div class="pill pill--lock" id="lockPill" title="Медиапоток зашифрован">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>
+      <span id="lockText">Шифруется</span>
+    </div>
+  </div>
+
+  <!-- Приглашение -->
+  <div class="invite" id="invitePanel">
+    <p>Отправьте ссылку собеседнику</p>
+    <div class="invite__row">
+      <input id="inviteLink" type="text" readonly aria-label="Ссылка на звонок">
+      <button class="btn btn--primary" id="copyBtn" type="button">Копировать</button>
+    </div>
+    <button class="linkbtn" id="shareBtn" type="button" hidden>Поделиться…</button>
+  </div>
+
+  <!-- Статистика -->
+  <section class="stats" id="statsPanel" hidden aria-label="Статистика соединения">
+    <header>
+      <h2>Качество соединения</h2>
+      <button class="ghost-btn" id="statsClose" type="button" aria-label="Закрыть">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
+    <div class="stats__grid" id="statsGrid"></div>
+    <div class="stats__note" id="statsNote"></div>
+  </section>
+
+  <!-- Нижняя панель -->
+  <div class="hud hud--bottom">
+    <div class="controls">
+      <button class="ctrl" id="micBtn" type="button" aria-pressed="true" title="Микрофон (M)">
+        <svg class="ic-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V7a3 3 0 0 1 3-3ZM5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        <svg class="ic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4l16 16M12 4a3 3 0 0 1 3 3v4M9 9v3a3 3 0 0 0 4.5 2.6M5 11a7 7 0 0 0 10.7 6M12 18v3"/></svg>
+        <em>Микрофон</em>
+      </button>
+
+      <button class="ctrl" id="camBtn" type="button" aria-pressed="true" title="Камера (V)">
+        <svg class="ic-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3.5l6 4.5V6z"/></svg>
+        <svg class="ic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4l16 16M15 11V7a1 1 0 0 0-1-1H7M3 7.5V17a1 1 0 0 0 1 1h10l1-1M21 6l-6 4.5v3"/></svg>
+        <em>Камера</em>
+      </button>
+
+      <button class="ctrl" id="shareScreenBtn" type="button" aria-pressed="false" title="Демонстрация экрана (D)">
+        <svg class="ic-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v11H3zM9 20h6M12 16v4"/></svg>
+        <svg class="ic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v11H3zM9 20h6M12 16v4M9 10.5 12 8l3 2.5"/></svg>
+        <em>Демо</em>
+      </button>
+
+      <button class="ctrl ctrl--only-wide" id="statsBtn" type="button" aria-pressed="false" title="Статистика (S)">
+        <svg class="ic-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7"/></svg>
+        <svg class="ic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7"/></svg>
+        <em>Статистика</em>
+      </button>
+
+      <button class="ctrl ctrl--end" id="hangupBtn" type="button" title="Завершить (E)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 13.5c5-5 14-5 19 0l-2.4 2.4a1.6 1.6 0 0 1-2 .2l-1.8-1.2a1.6 1.6 0 0 1-.7-1.3v-1.5a12 12 0 0 0-5.2 0v1.5a1.6 1.6 0 0 1-.7 1.3l-1.8 1.2a1.6 1.6 0 0 1-2-.2z"/></svg>
+        <em>Завершить</em>
+      </button>
+    </div>
+  </div>
+</main>
+
+<!-- ══════════════════ ЗАВЕРШЕНИЕ ══════════════════ -->
+<main id="ended" class="screen">
+  <div class="ended__box">
+    <h1 id="endedTitle">Звонок завершён</h1>
+    <p class="muted" id="endedText">Спасибо за разговор.</p>
+    <div class="actions actions--center">
+      <button class="btn btn--primary" id="rejoinBtn" type="button">Вернуться в звонок</button>
+      <button class="btn" id="homeBtn" type="button">На главную</button>
+    </div>
+  </div>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>
