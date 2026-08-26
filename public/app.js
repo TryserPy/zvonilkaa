@@ -6,7 +6,16 @@
 
 const $ = (id) => document.getElementById(id);
 
-/* ─────────────── Состояние ─────────────── */
+/**
+ * Порядок трансиверов фиксирован и одинаков на обеих сторонах, поэтому
+ * входящую дорожку можно опознать по её месту: 0 — микрофон, 1 — камера,
+ * 2 — экран, 3 — звук экрана. Это позволяет вести камеру и демонстрацию
+ * одновременно и включать их без переговоров о соединении.
+ */
+const ROLES = ['mic', 'cam', 'screen', 'screenAudio'];
+
+/** Порядок плиток в ленте миниатюр. */
+const TILE_ORDER = ['remote-screen', 'remote-cam', 'local-screen', 'local-cam'];
 
 const S = {
   roomId: null,
@@ -18,19 +27,27 @@ const S = {
   wsRetry: 0,
   pc: null,
 
-  localStream: null,
-  screenStream: null,
-  camTrack: null,
-  videoSender: null,
+  camStream: null,      // микрофон + камера
+  screenStream: null,   // экран + его звук
+  local: { mic: null, cam: null, screen: null, screenAudio: null },
+  send: { mic: null, cam: null, screen: null, screenAudio: null },
+  remote: { mic: null, cam: null, screen: null, screenAudio: null },
 
   micOn: true,
   camOn: true,
   sharing: false,
+  speakerOn: true,
   facing: 'user',
 
-  iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }],
+  main: null,
+  mainLocked: false,
+  remoteState: { mic: true, cam: false, screen: false },
 
-  // perfect negotiation
+  lowLatency: false,
+  shareAudio: true,
+  mirror: true,
+  sinkId: '',
+
   makingOffer: false,
   ignoreOffer: false,
   settingRemoteAnswer: false,
@@ -44,18 +61,17 @@ const S = {
   inCall: false,
 };
 
-/* Ступени качества исходящего видео (битрейт, кадры) */
 const LADDER = [
-  { bitrate: 2_500_000, fps: 30, label: 'Высокое' },
-  { bitrate: 1_200_000, fps: 30, label: 'Хорошее' },
-  { bitrate: 600_000, fps: 25, label: 'Среднее' },
-  { bitrate: 250_000, fps: 18, label: 'Экономное' },
+  { bitrate: 2_500_000, fps: 30, label: 'высокое' },
+  { bitrate: 1_200_000, fps: 30, label: 'хорошее' },
+  { bitrate: 600_000, fps: 25, label: 'среднее' },
+  { bitrate: 250_000, fps: 18, label: 'экономное' },
 ];
 
 /* ─────────────── Мелкие утилиты ─────────────── */
 
 let toastTimer;
-function toast(text, ms = 2600) {
+function toast(text, ms = 2400) {
   const el = $('toast');
   el.textContent = text;
   el.classList.add('is-on');
@@ -63,14 +79,13 @@ function toast(text, ms = 2600) {
   toastTimer = setTimeout(() => el.classList.remove('is-on'), ms);
 }
 
-function setInvite(visible) {
-  $('invitePanel').hidden = !visible;
-  $('call').classList.toggle('is-inviting', visible);
-}
-
 function show(screenId) {
   for (const el of document.querySelectorAll('.screen')) el.classList.remove('is-active');
   $(screenId).classList.add('is-active');
+}
+
+function setInvite(visible) {
+  $('invitePanel').hidden = !visible;
 }
 
 function randomRoomId() {
@@ -83,10 +98,23 @@ function randomRoomId() {
 const fmtKbps = (bps) =>
   bps >= 1_000_000 ? (bps / 1_000_000).toFixed(1) + ' Мбит/с' : Math.round(bps / 1000) + ' кбит/с';
 
+/* Настройки, которые стоит помнить между звонками */
+const prefs = {
+  get(key, fallback) {
+    try {
+      const v = localStorage.getItem('zv-' + key);
+      return v === null ? fallback : JSON.parse(v);
+    } catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem('zv-' + key, JSON.stringify(value)); } catch {}
+  },
+};
+
 /* ─────────────── Тема ─────────────── */
 
 (function initTheme() {
-  const saved = localStorage.getItem('zv-theme');
+  const saved = prefs.get('theme', null);
   if (saved) document.documentElement.dataset.theme = saved;
 })();
 
@@ -96,7 +124,7 @@ $('themeToggle').addEventListener('click', () => {
     root.dataset.theme === 'dark' ||
     (!root.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);
   root.dataset.theme = isDark ? 'light' : 'dark';
-  try { localStorage.setItem('zv-theme', root.dataset.theme); } catch {}
+  prefs.set('theme', root.dataset.theme);
 });
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -108,23 +136,20 @@ const AUDIO_CONSTRAINTS = {
   noiseSuppression: true,
   autoGainControl: true,
   channelCount: 1,
-  sampleRate: 48000,
 };
 
-function videoConstraints(facing) {
-  return {
-    width: { ideal: 1280 },
-    height: { ideal: 720 },
-    frameRate: { ideal: 30, max: 30 },
-    facingMode: { ideal: facing },
-  };
-}
+const videoConstraints = (facing) => ({
+  width: { ideal: 1280 },
+  height: { ideal: 720 },
+  frameRate: { ideal: 30, max: 30 },
+  facingMode: { ideal: facing },
+});
 
 async function ensureMedia() {
-  if (S.localStream) return S.localStream;
+  if (S.camStream) return S.camStream;
 
   if (!navigator.mediaDevices?.getUserMedia) {
-    toast('Браузер не поддерживает доступ к камере. Нужен HTTPS или localhost.', 6000);
+    toast('Браузер не даёт доступ к камере. Нужен HTTPS или localhost.', 6000);
     return null;
   }
 
@@ -137,7 +162,7 @@ async function ensureMedia() {
   for (const c of attempts) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia(c);
-      attachLocalStream(stream);
+      adoptCamStream(stream);
       if (!c.video) {
         S.camOn = false;
         toast('Камера недоступна — звонок только со звуком');
@@ -154,64 +179,53 @@ async function ensureMedia() {
   return null;
 }
 
-function attachLocalStream(stream) {
-  S.localStream = stream;
-  S.camTrack = stream.getVideoTracks()[0] || null;
+function adoptCamStream(stream) {
+  S.camStream = stream;
+  S.local.mic = stream.getAudioTracks()[0] || null;
+  S.local.cam = stream.getVideoTracks()[0] || null;
 
-  if (S.camTrack) {
-    try { S.camTrack.contentHint = 'motion'; } catch {}
-    S.camTrack.enabled = S.camOn;
+  if (S.local.mic) {
+    try { S.local.mic.contentHint = 'speech'; } catch {}
+    S.local.mic.enabled = S.micOn;
   }
-  const a = stream.getAudioTracks()[0];
-  if (a) {
-    try { a.contentHint = 'speech'; } catch {}
-    a.enabled = S.micOn;
+  if (S.local.cam) {
+    try { S.local.cam.contentHint = 'motion'; } catch {}
+    S.local.cam.enabled = S.camOn;
   }
 
   $('previewVideo').srcObject = stream;
-  $('localVideo').srcObject = stream;
-  refreshMediaUi();
-  startMeter(stream);
+  tileVideo('local-cam').srcObject = stream;
+
+  watchLevel('self', stream);
   listDevices();
+  refreshUi();
 }
 
-/* Индикатор громкости в лобби */
-let meterCtx, meterRaf;
-function startMeter(stream) {
-  const track = stream.getAudioTracks()[0];
-  if (!track || meterCtx) return;
-  try {
-    meterCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = meterCtx.createMediaStreamSource(stream);
-    const analyser = meterCtx.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.75;
-    src.connect(analyser);
-    const buf = new Uint8Array(analyser.frequencyBinCount);
-    const bar = $('previewMeter').firstElementChild;
+const tileEl = (id) => document.querySelector(`.tile[data-src="${id}"]`);
+const tileVideo = (id) => tileEl(id).querySelector('video');
 
-    const loop = () => {
-      analyser.getByteFrequencyData(buf);
-      let sum = 0;
-      for (const v of buf) sum += v * v;
-      const level = Math.min(100, Math.sqrt(sum / buf.length) * 2.6);
-      bar.style.width = (S.micOn ? level : 0) + '%';
-      meterRaf = requestAnimationFrame(loop);
-    };
-    loop();
-  } catch {}
-}
+/* ─────────────── Устройства ─────────────── */
 
 async function listDevices() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    fill($('micSelect'), devices.filter((d) => d.kind === 'audioinput'), 'Микрофон');
-    fill($('camSelect'), devices.filter((d) => d.kind === 'videoinput'), 'Камера');
-    $('flipBtn').hidden = devices.filter((d) => d.kind === 'videoinput').length < 2;
-  } catch {}
+  let devices = [];
+  try { devices = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
+
+  fillSelect($('micSelect'), devices.filter((d) => d.kind === 'audioinput'), 'Микрофон');
+  fillSelect($('camSelect'), devices.filter((d) => d.kind === 'videoinput'), 'Камера');
+
+  const outputs = devices.filter((d) => d.kind === 'audiooutput');
+  const canPick = typeof $('remoteAudio').setSinkId === 'function' && outputs.length > 0;
+  $('spkField').hidden = !canPick;
+  if (canPick) fillSelect($('spkSelect'), outputs, 'Устройство');
+
+  // Текущие устройства отмечаем в списках
+  const micId = S.local.mic?.getSettings().deviceId;
+  const camId = S.local.cam?.getSettings().deviceId;
+  if (micId) $('micSelect').value = micId;
+  if (camId) $('camSelect').value = camId;
 }
 
-function fill(select, devices, fallback) {
+function fillSelect(select, devices, fallback) {
   const current = select.value;
   select.innerHTML = '';
   devices.forEach((d, i) => {
@@ -223,9 +237,9 @@ function fill(select, devices, fallback) {
   if (devices.some((d) => d.deviceId === current)) select.value = current;
 }
 
-/** Смена устройства без разрыва звонка — replaceTrack. */
+/** Смена микрофона или камеры без разрыва звонка. */
 async function switchDevice(kind, deviceId) {
-  if (!S.localStream) return;
+  if (!S.camStream) return;
   try {
     const constraints =
       kind === 'audio'
@@ -233,27 +247,24 @@ async function switchDevice(kind, deviceId) {
         : { video: { ...videoConstraints(S.facing), deviceId: { exact: deviceId } } };
 
     const fresh = await navigator.mediaDevices.getUserMedia(constraints);
-    const newTrack = fresh.getTracks()[0];
-    const oldTrack = S.localStream.getTracks().find((t) => t.kind === kind);
+    const track = fresh.getTracks()[0];
+    const role = kind === 'audio' ? 'mic' : 'cam';
+    const old = S.local[role];
 
-    newTrack.enabled = kind === 'audio' ? S.micOn : S.camOn;
-    try { newTrack.contentHint = kind === 'audio' ? 'speech' : 'motion'; } catch {}
+    track.enabled = kind === 'audio' ? S.micOn : S.camOn;
+    try { track.contentHint = kind === 'audio' ? 'speech' : 'motion'; } catch {}
 
-    if (kind === 'video') S.camTrack = newTrack;
+    if (S.send[role]) await S.send[role].replaceTrack(track);
 
-    if (S.pc && !(kind === 'video' && S.sharing)) {
-      const sender =
-        kind === 'video'
-          ? S.videoSender
-          : S.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
-      if (sender) await sender.replaceTrack(newTrack);
-    }
+    if (old) { S.camStream.removeTrack(old); old.stop(); }
+    S.camStream.addTrack(track);
+    S.local[role] = track;
 
-    if (oldTrack) { S.localStream.removeTrack(oldTrack); oldTrack.stop(); }
-    S.localStream.addTrack(newTrack);
+    $('previewVideo').srcObject = S.camStream;
+    tileVideo('local-cam').srcObject = S.camStream;
+    if (kind === 'audio') watchLevel('self', S.camStream, true);
 
-    $('previewVideo').srcObject = S.localStream;
-    if (!S.sharing) $('localVideo').srcObject = S.localStream;
+    toast(kind === 'audio' ? 'Микрофон переключён' : 'Камера переключена', 1600);
   } catch {
     toast('Не удалось переключить устройство');
   }
@@ -261,47 +272,113 @@ async function switchDevice(kind, deviceId) {
 
 $('micSelect').addEventListener('change', (e) => switchDevice('audio', e.target.value));
 $('camSelect').addEventListener('change', (e) => switchDevice('video', e.target.value));
+$('spkSelect').addEventListener('change', (e) => setSink(e.target.value));
 
-$('flipBtn').addEventListener('click', async () => {
-  S.facing = S.facing === 'user' ? 'environment' : 'user';
-  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
-  const cur = S.camTrack?.getSettings().deviceId;
-  const next = cams.find((d) => d.deviceId !== cur);
-  if (next) switchDevice('video', next.deviceId);
-});
+async function setSink(deviceId) {
+  S.sinkId = deviceId;
+  prefs.set('sink', deviceId);
+  for (const el of [$('remoteAudio'), $('remoteScreenAudio')]) {
+    try { await el.setSinkId(deviceId); } catch {}
+  }
+  toast('Звук выводится на выбранное устройство', 1600);
+}
+
+/* ─────────────── Индикатор речи ─────────────── */
+
+let audioCtx = null;
+const meters = {};
+
+function watchLevel(who, stream, restart = false) {
+  if (!stream || !stream.getAudioTracks().length) return;
+  if (meters[who] && !restart) return;
+  if (meters[who]) { meters[who].stop(); delete meters[who]; }
+
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    source.connect(analyser);
+
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    let raf = 0;
+    let speaking = false;
+    let quietSince = 0;
+
+    const loop = () => {
+      analyser.getByteFrequencyData(buf);
+      let sum = 0;
+      for (const v of buf) sum += v * v;
+      const level = Math.min(1, Math.sqrt(sum / buf.length) / 48);
+
+      const gated = who === 'self' && !S.micOn ? 0 : level;
+      onLevel(who, gated);
+
+      // Небольшая задержка на затухание, чтобы рамка не мигала между словами
+      const now = performance.now();
+      if (gated > 0.12) { quietSince = 0; if (!speaking) { speaking = true; onSpeak(who, true); } }
+      else if (speaking) {
+        if (!quietSince) quietSince = now;
+        else if (now - quietSince > 450) { speaking = false; onSpeak(who, false); }
+      }
+
+      raf = requestAnimationFrame(loop);
+    };
+    loop();
+
+    meters[who] = {
+      stop() {
+        cancelAnimationFrame(raf);
+        try { source.disconnect(); } catch {}
+        onSpeak(who, false);
+        onLevel(who, 0);
+      },
+    };
+  } catch {}
+}
+
+function onLevel(who, level) {
+  if (who !== 'self') return;
+  const pct = Math.round(level * 100);
+  $('previewMeter').firstElementChild.style.width = pct + '%';
+  $('micBtn').style.setProperty('--lvl', level.toFixed(2));
+  $('micBtn').style.setProperty('--lvlop', level > 0.04 ? '1' : '0');
+}
+
+function onSpeak(who, on) {
+  const id = who === 'self' ? 'local-cam' : 'remote-cam';
+  tileEl(id)?.classList.toggle('is-speaking', on);
+}
 
 /* ─────────────── Переключатели ─────────────── */
 
 function setMic(on) {
   S.micOn = on;
-  S.localStream?.getAudioTracks().forEach((t) => (t.enabled = on));
-  refreshMediaUi();
+  if (S.local.mic) S.local.mic.enabled = on;
+  refreshUi();
   sendState();
 }
 
 function setCam(on) {
   S.camOn = on;
-  if (!S.sharing) S.localStream?.getVideoTracks().forEach((t) => (t.enabled = on));
-  refreshMediaUi();
+  if (S.local.cam) S.local.cam.enabled = on;
+  refreshUi();
   sendState();
 }
 
-function refreshMediaUi() {
-  const hasVideo = !!S.localStream?.getVideoTracks().length;
-  const camVisible = (S.camOn && hasVideo) || S.sharing;
-
-  for (const id of ['micBtn', 'prevMicBtn']) $(id).setAttribute('aria-pressed', String(S.micOn));
-  for (const id of ['camBtn', 'prevCamBtn']) $(id).setAttribute('aria-pressed', String(S.camOn && hasVideo));
-  $('shareScreenBtn').setAttribute('aria-pressed', String(S.sharing));
-
-  $('localTile').classList.toggle('is-off', !camVisible);
-  $('localTile').classList.toggle('is-screen', S.sharing);
-  document.querySelector('.preview').classList.toggle('is-live', camVisible);
-  $('previewOffText').textContent = hasVideo ? 'Камера выключена' : 'Камера недоступна';
+function setSpeaker(on) {
+  S.speakerOn = on;
+  for (const el of [$('remoteAudio'), $('remoteScreenAudio')]) el.muted = !on;
+  refreshUi();
 }
 
 $('micBtn').addEventListener('click', () => setMic(!S.micOn));
 $('camBtn').addEventListener('click', () => setCam(!S.camOn));
+$('speakerBtn').addEventListener('click', () => {
+  setSpeaker(!S.speakerOn);
+  toast(S.speakerOn ? 'Звук включён' : 'Звук выключен', 1400);
+});
 $('prevMicBtn').addEventListener('click', () => setMic(!S.micOn));
 $('prevCamBtn').addEventListener('click', () => setCam(!S.camOn));
 
@@ -316,40 +393,133 @@ async function startShare() {
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30, max: 30 } },
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      audio: S.shareAudio
+        ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        : false,
     });
 
     S.screenStream = stream;
     S.sharing = true;
-    const track = stream.getVideoTracks()[0];
-    try { track.contentHint = 'detail'; } catch {}
-    track.addEventListener('ended', stopShare);
 
-    if (S.videoSender) await S.videoSender.replaceTrack(track);
+    const video = stream.getVideoTracks()[0];
+    const audio = stream.getAudioTracks()[0] || null;
+    try { video.contentHint = 'detail'; } catch {}
+    video.addEventListener('ended', stopShare);
 
-    $('localVideo').srcObject = stream;
+    S.local.screen = video;
+    S.local.screenAudio = audio;
+
+    if (S.send.screen) await S.send.screen.replaceTrack(video);
+    if (audio && S.send.screenAudio) await S.send.screenAudio.replaceTrack(audio);
+
+    tileVideo('local-screen').srcObject = stream;
     await applySendParams();
-    refreshMediaUi();
+    S.mainLocked = false;
+    refreshUi();
     sendState();
-    toast('Вы показываете экран');
+    toast(audio ? 'Показываете экран со звуком' : 'Показываете экран');
   } catch {
-    /* пользователь отменил выбор окна */
+    /* пользователь закрыл выбор окна */
   }
 }
 
 async function stopShare() {
   if (!S.sharing) return;
   S.sharing = false;
+
+  if (S.send.screen) await S.send.screen.replaceTrack(null);
+  if (S.send.screenAudio) await S.send.screenAudio.replaceTrack(null);
+
   S.screenStream?.getTracks().forEach((t) => t.stop());
   S.screenStream = null;
+  S.local.screen = null;
+  S.local.screenAudio = null;
+  tileVideo('local-screen').srcObject = null;
 
-  if (S.videoSender) await S.videoSender.replaceTrack(S.camTrack || null);
-  if (S.camTrack) S.camTrack.enabled = S.camOn;
-
-  $('localVideo').srcObject = S.localStream;
   await applySendParams();
-  refreshMediaUi();
+  S.mainLocked = false;
+  refreshUi();
   sendState();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   РАСКЛАДКА
+   ═══════════════════════════════════════════════════════════════════ */
+
+const TILE_LIVE = {
+  'local-cam': () => !!S.camStream,
+  'local-screen': () => S.sharing,
+  'remote-cam': () => S.peerPresent,
+  'remote-screen': () => S.peerPresent && S.remoteState.screen,
+};
+
+// Что показывать крупно, если пользователь ещё не выбрал сам
+const AUTO_PRIORITY = ['remote-screen', 'remote-cam', 'local-screen', 'local-cam'];
+
+function setMain(id, byUser = false) {
+  if (!id || S.main === id) return;
+  S.main = id;
+  if (byUser) S.mainLocked = true;
+  refreshUi();
+}
+
+for (const id of TILE_ORDER) {
+  tileEl(id).addEventListener('click', function () {
+    if (this.classList.contains('is-thumb')) setMain(id, true);
+  });
+}
+
+function refreshUi() {
+  const hasCamVideo = !!S.local.cam;
+  const camLive = S.camOn && hasCamVideo;
+
+  // Кнопки
+  $('micBtn').setAttribute('aria-pressed', String(S.micOn));
+  $('camBtn').setAttribute('aria-pressed', String(camLive));
+  $('speakerBtn').setAttribute('aria-pressed', String(S.speakerOn));
+  $('shareScreenBtn').setAttribute('aria-pressed', String(S.sharing));
+  $('prevMicBtn').setAttribute('aria-pressed', String(S.micOn));
+  $('prevCamBtn').setAttribute('aria-pressed', String(camLive));
+  $('previewOffText').textContent = hasCamVideo ? 'Камера выключена' : 'Камера недоступна';
+  $('preview').classList.toggle('is-live', camLive);
+
+  // Какие плитки живы
+  const visible = TILE_ORDER.filter((id) => TILE_LIVE[id]());
+
+  if (!visible.includes(S.main)) { S.main = null; S.mainLocked = false; }
+  if (!S.main || !S.mainLocked) {
+    const auto = AUTO_PRIORITY.find((id) => visible.includes(id));
+    if (auto) S.main = auto;
+  }
+
+  let thumbIndex = 0;
+  for (const id of TILE_ORDER) {
+    const el = tileEl(id);
+    const live = visible.includes(id);
+    el.hidden = !live;
+    if (!live) continue;
+
+    const isMain = id === S.main;
+    el.classList.toggle('is-main', isMain);
+    el.classList.toggle('is-thumb', !isMain);
+    if (!isMain) el.style.setProperty('--i', thumbIndex++);
+
+    // Экран показываем целиком, лицо — кадрируем
+    el.style.setProperty('--fit', id.endsWith('screen') ? 'contain' : 'cover');
+
+    // Затемнение, когда видео нет
+    const dark =
+      (id === 'local-cam' && !camLive) ||
+      (id === 'remote-cam' && !S.remoteState.cam);
+    el.classList.toggle('is-dark', dark);
+  }
+
+  // Значки выключенного микрофона
+  tileEl('local-cam').querySelector('.ic-badge--mic').hidden = S.micOn;
+  tileEl('remote-cam').querySelector('.ic-badge--mic').hidden = S.remoteState.mic !== false;
+
+  $('tiles').classList.toggle('no-mirror', !S.mirror);
+  $('stageEmpty').hidden = !!S.main;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -381,16 +551,14 @@ function connectSignaling() {
 }
 
 function signal(data) {
-  if (S.ws?.readyState === WebSocket.OPEN) {
-    S.ws.send(JSON.stringify({ type: 'signal', data }));
-  }
+  if (S.ws?.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify({ type: 'signal', data }));
 }
 
 function sendState() {
   signal({
     state: {
-      mic: S.micOn,
-      cam: (S.camOn && !!S.localStream?.getVideoTracks().length) || S.sharing,
+      mic: S.micOn && !!S.local.mic,
+      cam: (S.camOn && !!S.local.cam) || false,
       screen: S.sharing,
     },
   });
@@ -405,7 +573,7 @@ async function handleSignal(m) {
     case 'joined':
       S.peerId = m.peerId;
       S.polite = m.polite;
-      if (m.peers.length) { S.peerPresent = true; await startPeerConnection(); }
+      if (m.peers.length) { S.peerPresent = true; await startPeerConnection(); refreshUi(); }
       else { setStatus('connecting', 'Ждём собеседника'); setInvite(true); }
       break;
 
@@ -415,6 +583,7 @@ async function handleSignal(m) {
       beep(660);
       await startPeerConnection();
       sendState();
+      refreshUi();
       break;
 
     case 'peer-left':
@@ -435,7 +604,12 @@ async function handleSignal(m) {
 async function onRemoteSignal(data) {
   if (!data) return;
 
-  if (data.state) return applyRemoteState(data.state);
+  if (data.state) {
+    S.remoteState = { ...S.remoteState, ...data.state };
+    refreshUi();
+    return;
+  }
+
   if (!S.pc) await startPeerConnection();
   const pc = S.pc;
 
@@ -451,6 +625,7 @@ async function onRemoteSignal(data) {
       S.settingRemoteAnswer = desc.type === 'answer';
       await pc.setRemoteDescription(desc);
       S.settingRemoteAnswer = false;
+      await bindRoles();
 
       if (desc.type === 'offer') {
         const answer = await pc.createAnswer();
@@ -467,19 +642,11 @@ async function onRemoteSignal(data) {
   }
 }
 
-function applyRemoteState(state) {
-  const off = !state.cam;
-  $('remoteTile').classList.toggle('is-off', off);
-  $('remoteTile').classList.toggle('is-cover', !state.screen);
-  $('remoteOffText').textContent = 'Камера выключена';
-  $('remoteTag').hidden = state.mic !== false;
-}
-
 /* ═══════════════════════════════════════════════════════════════════
    PEER CONNECTION
    ═══════════════════════════════════════════════════════════════════ */
 
-/** Мягкая правка SDP: включаем FEC и DTX у Opus — меньше трафика, ровнее звук. */
+/** Мягкая правка SDP: включаем FEC и DTX у Opus — ровнее звук, меньше трафика. */
 function tuneSdp(sdp) {
   try {
     const pt = sdp.match(/a=rtpmap:(\d+)\s+opus\/48000/i)?.[1];
@@ -498,12 +665,36 @@ function tuneSdp(sdp) {
   } catch { return sdp; }
 }
 
-/** Некоторые браузеры отвергают правленый SDP — тогда откатываемся к исходному. */
 async function setLocalSafe(desc) {
-  try {
-    await S.pc.setLocalDescription(desc);
-  } catch {
-    await S.pc.setLocalDescription();
+  try { await S.pc.setLocalDescription(desc); }
+  catch { await S.pc.setLocalDescription(); }
+}
+
+/**
+ * Сопоставляет дорожки соединения с ролями и подключает к ним локальные
+ * треки. Вызывается после каждого применения удалённого описания —
+ * повторные вызовы безвредны.
+ */
+async function bindRoles() {
+  const pc = S.pc;
+  if (!pc) return;
+  const list = pc.getTransceivers();
+  if (list.length < ROLES.length) return;
+
+  for (let i = 0; i < ROLES.length; i++) {
+    const role = ROLES[i];
+    const t = list[i];
+    S.send[role] = t.sender;
+
+    // Отвечающая сторона получает дорожки в режиме «только приём» —
+    // разрешаем и отправку, иначе её камеру никто не увидит.
+    if (t.direction !== 'sendrecv' && !t.stopped) {
+      try { t.direction = 'sendrecv'; } catch {}
+    }
+    const track = S.local[role] || null;
+    if (t.sender.track !== track) {
+      try { await t.sender.replaceTrack(track); } catch {}
+    }
   }
 }
 
@@ -511,27 +702,15 @@ async function startPeerConnection() {
   if (S.pc) return S.pc;
 
   const pc = new RTCPeerConnection({
-    iceServers: S.iceServers,
+    iceServers: S.iceServers || [{ urls: ['stun:stun.l.google.com:19302'] }],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
-    iceCandidatePoolSize: 2,
+    iceCandidatePoolSize: 4,
   });
   S.pc = pc;
 
-  // Порядок трансиверов фиксируем сразу: сначала аудио, потом видео.
-  const audio = S.localStream?.getAudioTracks()[0];
-  const video = S.sharing
-    ? S.screenStream?.getVideoTracks()[0]
-    : S.localStream?.getVideoTracks()[0];
-
-  if (audio) pc.addTransceiver(audio, { direction: 'sendrecv', streams: [S.localStream] });
-  else pc.addTransceiver('audio', { direction: 'recvonly' });
-
-  const vt = video
-    ? pc.addTransceiver(video, { direction: 'sendrecv', streams: [S.localStream] })
-    : pc.addTransceiver('video', { direction: 'recvonly' });
-  S.videoSender = vt.sender;
-
+  // Слушатель вешаем до создания дорожек: событие о необходимости
+  // переговоров прилетает почти сразу и не должно уйти в пустоту.
   pc.addEventListener('negotiationneeded', async () => {
     try {
       S.makingOffer = true;
@@ -546,18 +725,51 @@ async function startPeerConnection() {
     }
   });
 
+  // Дорожки создаёт только инициатор — первый, кто оказался в комнате.
+  // По спецификации транссиверы, созданные через addTransceiver, не
+  // переиспользуются при входящем оффере: если бы их создавали обе стороны,
+  // получилось бы восемь потоков вместо четырёх. Второй участник подхватит
+  // уже готовые в bindRoles() после того, как применит оффер.
+  if (!S.polite) {
+    const transceivers = ROLES.map((role) =>
+      pc.addTransceiver(role === 'cam' || role === 'screen' ? 'video' : 'audio', {
+        direction: 'sendrecv',
+      })
+    );
+    ROLES.forEach((role, i) => (S.send[role] = transceivers[i].sender));
+    await bindRoles();
+  }
+
   pc.addEventListener('icecandidate', ({ candidate }) => {
     if (candidate) signal({ candidate });
   });
 
   pc.addEventListener('track', (e) => {
-    const [stream] = e.streams;
-    const el = $('remoteVideo');
-    if (el.srcObject !== stream) el.srcObject = stream;
-    $('remoteTile').classList.remove('is-off');
-    el.play?.().catch(() => {});
-    // Небольшой буфер приёма выравнивает звук на нестабильной сети.
-    try { if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 60; } catch {}
+    const index = pc.getTransceivers().indexOf(e.transceiver);
+    const role = ROLES[index];
+    if (!role) return;
+
+    const stream = new MediaStream([e.track]);
+    S.remote[role] = stream;
+
+    if (role === 'mic') {
+      $('remoteAudio').srcObject = stream;
+      $('remoteAudio').muted = !S.speakerOn;
+      if (S.sinkId) $('remoteAudio').setSinkId?.(S.sinkId).catch(() => {});
+      watchLevel('peer', stream, true);
+    } else if (role === 'screenAudio') {
+      $('remoteScreenAudio').srcObject = stream;
+      $('remoteScreenAudio').muted = !S.speakerOn;
+      if (S.sinkId) $('remoteScreenAudio').setSinkId?.(S.sinkId).catch(() => {});
+    } else {
+      const video = tileVideo(role === 'cam' ? 'remote-cam' : 'remote-screen');
+      video.muted = true;
+      video.srcObject = stream;
+      video.play?.().catch(() => {});
+    }
+
+    applyLatency();
+    refreshUi();
   });
 
   pc.addEventListener('iceconnectionstatechange', () => {
@@ -573,17 +785,12 @@ async function startPeerConnection() {
         setStatus('live', 'Соединение установлено');
         setInvite(false);
         applySendParams();
+        applyLatency();
         sendState();
         break;
-      case 'connecting':
-        setStatus('connecting', 'Подключение…');
-        break;
-      case 'disconnected':
-        setStatus('bad', 'Связь нестабильна');
-        break;
-      case 'failed':
-        setStatus('bad', 'Связь потеряна');
-        break;
+      case 'connecting': setStatus('connecting', 'Подключение…'); break;
+      case 'disconnected': setStatus('bad', 'Связь нестабильна'); break;
+      case 'failed': setStatus('bad', 'Связь потеряна'); break;
     }
   });
 
@@ -593,42 +800,68 @@ async function startPeerConnection() {
 
 /** Ограничение исходящего потока — главный рычаг оптимизации. */
 async function applySendParams() {
-  const sender = S.videoSender;
-  if (!sender || !sender.track) return;
-  try {
-    const p = sender.getParameters();
-    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  const tune = async (sender, opts) => {
+    if (!sender || !sender.track) return;
+    try {
+      const p = sender.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      Object.assign(p.encodings[0], opts.encoding);
+      if (opts.degradation) p.degradationPreference = opts.degradation;
+      await sender.setParameters(p);
+    } catch {}
+  };
 
-    if (S.sharing) {
-      p.encodings[0].maxBitrate = 3_000_000;
-      p.encodings[0].maxFramerate = 30;
-      p.encodings[0].scaleResolutionDownBy = 1;
-      p.degradationPreference = 'maintain-resolution'; // текст должен оставаться читаемым
-    } else {
-      const step = LADDER[S.quality];
-      p.encodings[0].maxBitrate = step.bitrate;
-      p.encodings[0].maxFramerate = step.fps;
-      p.encodings[0].scaleResolutionDownBy = 1;
-      p.degradationPreference = 'balanced';
-    }
-    await sender.setParameters(p);
-  } catch {}
+  // Голос важнее картинки: помечаем его высоким приоритетом в сети
+  await tune(S.send.mic, { encoding: { priority: 'high', networkPriority: 'high' } });
+
+  const step = LADDER[S.quality];
+  await tune(S.send.cam, {
+    encoding: {
+      maxBitrate: step.bitrate,
+      maxFramerate: step.fps,
+      scaleResolutionDownBy: 1,
+      networkPriority: S.sharing ? 'low' : 'medium',
+    },
+    degradation: 'balanced',
+  });
+
+  await tune(S.send.screen, {
+    encoding: { maxBitrate: 3_000_000, maxFramerate: 30, scaleResolutionDownBy: 1, networkPriority: 'high' },
+    degradation: 'maintain-resolution', // текст должен оставаться читаемым
+  });
+}
+
+/**
+ * Буфер приёма — самая управляемая часть задержки. По умолчанию браузер
+ * держит его побольше ради плавности; в режиме низкой задержки убираем.
+ */
+function applyLatency() {
+  if (!S.pc) return;
+  for (const r of S.pc.getReceivers()) {
+    try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = S.lowLatency ? 0 : null; } catch {}
+    try { if ('playoutDelayHint' in r) r.playoutDelayHint = S.lowLatency ? 0 : undefined; } catch {}
+  }
 }
 
 function onPeerLeft() {
   S.peerPresent = false;
-  $('remoteVideo').srcObject = null;
-  $('remoteTile').classList.add('is-off');
-  $('remoteOffText').textContent = 'Собеседник вышел';
-  $('remoteTag').hidden = true;
+  S.remoteState = { mic: true, cam: false, screen: false };
+  for (const id of ['remote-cam', 'remote-screen']) tileVideo(id).srcObject = null;
+  $('remoteAudio').srcObject = null;
+  $('remoteScreenAudio').srcObject = null;
+  meters.peer?.stop();
+  delete meters.peer;
+
+  $('stageEmptyText').textContent = 'Собеседник вышел';
   setInvite(true);
   setStatus('connecting', 'Ждём собеседника');
 
   S.pc?.close();
   S.pc = null;
-  S.videoSender = null;
+  S.send = { mic: null, cam: null, screen: null, screenAudio: null };
   S.prev = null;
   stopStats();
+  refreshUi();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -661,13 +894,13 @@ async function collectStats() {
 
   const now = performance.now();
   const acc = {
-    rtt: null, jitter: null, loss: null,
-    inVideo: 0, inAudio: 0, out: 0,
+    rtt: null, jitter: null, buffer: null,
+    inBytes: 0, outBytes: 0,
     width: 0, height: 0, fps: 0,
-    codec: null, route: null,
-    dtls: null, srtp: null,
+    codec: null, route: null, srtp: null, dtls: null,
     localFp: null, remoteFp: null,
     packetsLost: 0, packetsRecv: 0,
+    bufferDelay: 0, bufferCount: 0,
   };
 
   const byId = new Map();
@@ -681,10 +914,10 @@ async function collectStats() {
       if (local && remote) {
         acc.route =
           local.candidateType === 'relay' || remote.candidateType === 'relay'
-            ? 'Через TURN-сервер'
+            ? 'через TURN-сервер'
             : local.candidateType === 'host' && remote.candidateType === 'host'
-            ? 'Прямое (локальная сеть)'
-            : 'Прямое P2P';
+            ? 'прямое, локальная сеть'
+            : 'прямое P2P';
       }
     }
 
@@ -695,20 +928,23 @@ async function collectStats() {
     if (r.type === 'inbound-rtp' && !r.isRemote) {
       acc.packetsLost += r.packetsLost || 0;
       acc.packetsRecv += r.packetsReceived || 0;
+      acc.inBytes += r.bytesReceived || 0;
       if (r.jitter != null) acc.jitter = Math.max(acc.jitter ?? 0, r.jitter * 1000);
-      if (r.kind === 'video') {
-        acc.inVideo += r.bytesReceived || 0;
-        acc.width = r.frameWidth || acc.width;
-        acc.height = r.frameHeight || acc.height;
+
+      if (r.kind === 'audio' && r.jitterBufferDelay != null && r.jitterBufferEmittedCount) {
+        acc.bufferDelay += r.jitterBufferDelay;
+        acc.bufferCount += r.jitterBufferEmittedCount;
+      }
+      if (r.kind === 'video' && r.frameWidth) {
+        acc.width = r.frameWidth;
+        acc.height = r.frameHeight;
         acc.fps = r.framesPerSecond || acc.fps;
         const c = byId.get(r.codecId);
         if (c?.mimeType) acc.codec = c.mimeType.split('/')[1].toUpperCase();
-      } else {
-        acc.inAudio += r.bytesReceived || 0;
       }
     }
 
-    if (r.type === 'outbound-rtp' && !r.isRemote) acc.out += r.bytesSent || 0;
+    if (r.type === 'outbound-rtp' && !r.isRemote) acc.outBytes += r.bytesSent || 0;
 
     if (r.type === 'transport') {
       acc.dtls = r.dtlsCipher || acc.dtls;
@@ -720,25 +956,20 @@ async function collectStats() {
     }
   });
 
-  // Скорости
+  if (acc.bufferCount) acc.buffer = (acc.bufferDelay / acc.bufferCount) * 1000;
+
   let inBps = 0, outBps = 0, lossPct = 0;
   if (S.prev) {
     const dt = (now - S.prev.t) / 1000;
     if (dt > 0.2) {
-      inBps = Math.max(0, ((acc.inVideo + acc.inAudio - S.prev.in) * 8) / dt);
-      outBps = Math.max(0, ((acc.out - S.prev.out) * 8) / dt);
+      inBps = Math.max(0, ((acc.inBytes - S.prev.in) * 8) / dt);
+      outBps = Math.max(0, ((acc.outBytes - S.prev.out) * 8) / dt);
       const dLost = acc.packetsLost - S.prev.lost;
       const dRecv = acc.packetsRecv - S.prev.recv;
       if (dLost + dRecv > 0) lossPct = (dLost / (dLost + dRecv)) * 100;
     }
   }
-  S.prev = {
-    t: now,
-    in: acc.inVideo + acc.inAudio,
-    out: acc.out,
-    lost: acc.packetsLost,
-    recv: acc.packetsRecv,
-  };
+  S.prev = { t: now, in: acc.inBytes, out: acc.outBytes, lost: acc.packetsLost, recv: acc.packetsRecv };
 
   renderPing(acc.rtt);
   adaptQuality(acc.rtt, lossPct);
@@ -754,16 +985,13 @@ function renderPing(rtt) {
   el.className = ms < 80 ? 'is-good' : ms < 200 ? 'is-mid' : 'is-bad';
 }
 
-/** Плавная адаптация: падаем быстро, поднимаемся осторожно. */
 function adaptQuality(rtt, loss) {
-  if (S.sharing || rtt == null) return;
+  if (rtt == null) return;
   const bad = loss > 4 || rtt > 350;
   const good = loss < 1 && rtt < 180;
 
   if (bad && S.quality < LADDER.length - 1) {
-    S.quality++;
-    S.qualityHold = 0;
-    applySendParams();
+    S.quality++; S.qualityHold = 0; applySendParams();
   } else if (good && S.quality > 0) {
     if (++S.qualityHold >= 12) { S.quality--; S.qualityHold = 0; applySendParams(); }
   } else {
@@ -771,7 +999,6 @@ function adaptQuality(rtt, loss) {
   }
 }
 
-/** Короткий код безопасности из отпечатков сертификатов обеих сторон. */
 async function renderSecurity(acc) {
   if (acc.dtls) $('lockText').textContent = 'Зашифровано';
   if (S.fingerprint || !acc.localFp || !acc.remoteFp || !crypto.subtle) return;
@@ -785,13 +1012,13 @@ async function renderSecurity(acc) {
 
 const STAT_ROWS = [
   ['Пинг', (d) => (d.rtt == null ? '—' : Math.round(d.rtt) + ' мс')],
+  ['Буфер приёма', (d) => (d.buffer == null ? '—' : Math.round(d.buffer) + ' мс')],
   ['Потери', (d) => d.loss.toFixed(1) + ' %'],
+  ['Джиттер', (d) => (d.jitter == null ? '—' : Math.round(d.jitter) + ' мс')],
   ['Приём', (d) => fmtKbps(d.inBps)],
   ['Отдача', (d) => fmtKbps(d.outBps)],
   ['Разрешение', (d) => (d.width ? `${d.width}×${d.height}` : '—')],
   ['Кадры', (d) => (d.fps ? Math.round(d.fps) + ' к/с' : '—')],
-  ['Джиттер', (d) => (d.jitter == null ? '—' : Math.round(d.jitter) + ' мс')],
-  ['Кодек', (d) => d.codec || '—'],
 ];
 
 function renderStatsPanel(acc, inBps, outBps, loss) {
@@ -799,23 +1026,68 @@ function renderStatsPanel(acc, inBps, outBps, loss) {
   const d = { ...acc, inBps, outBps, loss };
 
   const cells = STAT_ROWS.map(([label, fn]) => `<div class="stat"><span>${label}</span><b>${fn(d)}</b></div>`);
+
+  // Ощущаемая задержка: полпути по сети плюс буфер приёма
+  const mouthToEar = acc.rtt != null && acc.buffer != null ? Math.round(acc.rtt / 2 + acc.buffer) : null;
+  cells.push(`<div class="stat stat--wide"><span>Задержка звука</span><b>${mouthToEar == null ? '—' : mouthToEar + ' мс'}</b></div>`);
   cells.push(`<div class="stat stat--wide"><span>Маршрут</span><b>${acc.route || '—'}</b></div>`);
-  cells.push(
-    `<div class="stat stat--wide"><span>Шифрование</span><b>${acc.srtp || acc.dtls || 'DTLS-SRTP'}</b></div>`
-  );
+  cells.push(`<div class="stat stat--wide"><span>Шифрование</span><b>${acc.srtp || acc.dtls || 'DTLS-SRTP'}</b></div>`);
   $('statsGrid').innerHTML = cells.join('');
 
-  const mode = S.sharing ? 'демонстрация экрана' : LADDER[S.quality].label.toLowerCase();
-  $('statsNote').innerHTML =
-    `Режим отправки: <b>${mode}</b> — качество подстраивается под канал автоматически.` +
-    (S.fingerprint
-      ? `<br>Код безопасности: <b>${S.fingerprint}</b> — он должен совпадать у обоих собеседников.`
-      : '');
+  const parts = [`Отправка: <b>${LADDER[S.quality].label}</b>, подстраивается автоматически.`];
+  if (acc.codec) parts.push(`Кодек: <b>${acc.codec}</b>.`);
+  if (S.fingerprint) parts.push(`Код безопасности: <b>${S.fingerprint}</b> — должен совпадать у обоих.`);
+  if (acc.rtt != null && acc.rtt > 150) {
+    parts.push(
+      acc.route === 'через TURN-сервер'
+        ? 'Высокий пинг из-за ретранслятора: трафик идёт через TURN, а не напрямую.'
+        : 'Высокий пинг задан маршрутом до собеседника. Помогают провод вместо Wi-Fi и отключение VPN.'
+    );
+  }
+  $('statsNote').innerHTML = parts.join('<br>');
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   ЭКРАНЫ И НАВИГАЦИЯ
+   ПАНЕЛИ И НАВИГАЦИЯ
    ═══════════════════════════════════════════════════════════════════ */
+
+function togglePanel(id, btnId) {
+  const panel = $(id);
+  const other = id === 'statsPanel' ? 'settingsPanel' : 'statsPanel';
+  const otherBtn = id === 'statsPanel' ? 'settingsBtn' : 'statsBtn';
+  $(other).hidden = true;
+  $(otherBtn).setAttribute('aria-pressed', 'false');
+
+  panel.hidden = !panel.hidden;
+  $(btnId).setAttribute('aria-pressed', String(!panel.hidden));
+}
+
+$('statsBtn').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
+$('pingPill').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
+$('statsClose').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
+$('settingsBtn').addEventListener('click', () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); });
+$('settingsClose').addEventListener('click', () => togglePanel('settingsPanel', 'settingsBtn'));
+
+/* Переключатели в настройках */
+function bindSwitch(id, key, onChange) {
+  const el = $(id);
+  el.checked = prefs.get(key, el.checked);
+  S[key] = el.checked;
+  el.addEventListener('change', () => {
+    S[key] = el.checked;
+    prefs.set(key, el.checked);
+    onChange?.(el.checked);
+  });
+}
+
+bindSwitch('lowLatency', 'lowLatency', (on) => {
+  applyLatency();
+  toast(on ? 'Режим низкой задержки включён' : 'Обычный режим приёма', 1800);
+});
+bindSwitch('shareAudio', 'shareAudio');
+bindSwitch('mirrorSelf', 'mirror', refreshUi);
+
+/* ─────────────── Экраны ─────────────── */
 
 async function enterCall(roomId) {
   S.roomId = roomId;
@@ -828,16 +1100,16 @@ async function enterCall(roomId) {
   $('remoteAvatar').textContent = roomId[0].toUpperCase();
   $('inviteLink').value = location.origin + '/' + roomId;
   $('shareBtn').hidden = !navigator.share;
+  $('stageEmptyText').textContent = 'Ожидание собеседника…';
   setInvite(false);
-  $('remoteTile').classList.add('is-off', 'is-cover');
-  $('remoteOffText').textContent = 'Ожидание собеседника…';
-  $('remoteTag').hidden = true;
 
   show('call');
   setStatus('connecting', 'Подключение…');
 
   await ensureMedia();
-  refreshMediaUi();
+  S.sinkId = prefs.get('sink', '');
+  if (S.sinkId) setSink(S.sinkId);
+  refreshUi();
   connectSignaling();
   requestWakeLock();
 }
@@ -850,13 +1122,20 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.ws = null;
   S.pc?.close();
   S.pc = null;
-  S.videoSender = null;
+  S.send = { mic: null, cam: null, screen: null, screenAudio: null };
   S.screenStream?.getTracks().forEach((t) => t.stop());
   S.screenStream = null;
   S.sharing = false;
+  S.peerPresent = false;
   S.prev = null;
   S.quality = 0;
-  $('remoteVideo').srcObject = null;
+  S.main = null;
+  S.mainLocked = false;
+  meters.peer?.stop();
+  delete meters.peer;
+  for (const id of ['remote-cam', 'remote-screen', 'local-screen']) tileVideo(id).srcObject = null;
+  $('remoteAudio').srcObject = null;
+  $('remoteScreenAudio').srcObject = null;
   releaseWakeLock();
 
   $('endedTitle').textContent = title;
@@ -867,8 +1146,8 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
 
 function goHome() {
   history.replaceState({}, '', '/');
-  $('previewVideo').srcObject = S.localStream;
-  refreshMediaUi();
+  $('previewVideo').srcObject = S.camStream;
+  refreshUi();
   show('lobby');
 }
 
@@ -902,42 +1181,49 @@ $('shareBtn').addEventListener('click', () => {
   navigator.share?.({ title: 'Звонок в Звонилке', url: $('inviteLink').value }).catch(() => {});
 });
 
-/* Статистика */
-const toggleStats = () => {
-  const panel = $('statsPanel');
-  panel.hidden = !panel.hidden;
-  $('statsBtn').setAttribute('aria-pressed', String(!panel.hidden));
-};
-$('statsBtn').addEventListener('click', toggleStats);
-$('pingPill').addEventListener('click', toggleStats);
-$('statsClose').addEventListener('click', toggleStats);
-
 /* ─────────────── Горячие клавиши ─────────────── */
+
+const KEYS = {
+  m: () => { setMic(!S.micOn); toast(S.micOn ? 'Микрофон включён' : 'Микрофон выключен', 1200); },
+  v: () => { setCam(!S.camOn); toast(S.camOn ? 'Камера включена' : 'Камера выключена', 1200); },
+  d: () => (S.sharing ? stopShare() : startShare()),
+  a: () => { setSpeaker(!S.speakerOn); toast(S.speakerOn ? 'Звук включён' : 'Звук выключен', 1200); },
+  s: () => togglePanel('statsPanel', 'statsBtn'),
+  k: () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); },
+  e: () => endCall(),
+  f: () => {
+    const el = tileEl(S.main);
+    if (!el) return;
+    document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.().catch(() => {});
+  },
+};
+// Раскладка не должна мешать: те же клавиши в кириллице
+const RU = { ь: 'm', м: 'v', в: 'd', ф: 'a', ы: 's', л: 'k', у: 'e', а: 'f' };
 
 addEventListener('keydown', (e) => {
   if (!S.inCall || e.metaKey || e.ctrlKey || e.altKey) return;
   if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) return;
-  const k = e.key.toLowerCase();
-  if (k === 'm' || k === 'ь') { setMic(!S.micOn); toast(S.micOn ? 'Микрофон включён' : 'Микрофон выключен', 1200); }
-  else if (k === 'v' || k === 'м') { setCam(!S.camOn); toast(S.camOn ? 'Камера включена' : 'Камера выключена', 1200); }
-  else if (k === 'd' || k === 'в') { S.sharing ? stopShare() : startShare(); }
-  else if (k === 's' || k === 'ы') { toggleStats(); }
-  else if (k === 'e') { endCall(); }
+  const raw = e.key.toLowerCase();
+  const key = KEYS[raw] ? raw : RU[raw];
+  if (key && KEYS[key]) { e.preventDefault(); KEYS[key](); }
+  // Цифрами выбираем, что показать крупно
+  if (/^[1-4]$/.test(raw)) {
+    const visible = TILE_ORDER.filter((id) => TILE_LIVE[id]());
+    const pick = visible[Number(raw) - 1];
+    if (pick) setMain(pick, true);
+  }
 });
 
 /* ─────────────── Экономия ресурсов ─────────────── */
 
-// Пока вкладка скрыта, нет смысла слать видео в полном качестве.
 document.addEventListener('visibilitychange', () => {
-  if (!S.pc || S.sharing) return;
-  const sender = S.videoSender;
-  if (!sender || !sender.track) return;
+  if (!S.send.cam?.track) return;
   try {
-    const p = sender.getParameters();
+    const p = S.send.cam.getParameters();
     if (!p.encodings?.length) return;
     p.encodings[0].maxBitrate = document.hidden ? 150_000 : LADDER[S.quality].bitrate;
     p.encodings[0].maxFramerate = document.hidden ? 8 : LADDER[S.quality].fps;
-    sender.setParameters(p);
+    S.send.cam.setParameters(p);
   } catch {}
 });
 
@@ -958,22 +1244,31 @@ addEventListener('beforeunload', () => {
 
 navigator.mediaDevices?.addEventListener?.('devicechange', listDevices);
 
-/* Короткий сигнал при входе и выходе собеседника */
+// Браузер держит звук на паузе до первого действия пользователя — будим его,
+// иначе индикатор речи и сигналы будут молчать при входе по прямой ссылке.
+for (const ev of ['pointerdown', 'keydown']) {
+  addEventListener(ev, () => { if (audioCtx?.state === 'suspended') audioCtx.resume().catch(() => {}); }, { passive: true });
+}
+
 function beep(freq) {
   try {
-    const ctx = meterCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx = ctx;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.frequency.value = freq;
     osc.type = 'sine';
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.07, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.02);
     gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
     osc.connect(gain).connect(ctx.destination);
     osc.start();
     osc.stop(ctx.currentTime + 0.26);
   } catch {}
 }
+
+/* Точка для отладки из консоли браузера */
+window.__zv = S;
 
 /* ─────────────── Старт ─────────────── */
 
@@ -984,7 +1279,6 @@ function beep(freq) {
     enterCall(path);
   } else {
     show('lobby');
-    // Заранее просим доступ — так пользователь видит себя ещё до звонка.
     ensureMedia();
   }
 })();
