@@ -159,6 +159,12 @@ const S = {
   wsTimer: null,
   offerAsked: 0,
   leaveTimer: null,
+  // Ретранслятор: работает ли он на самом деле, а не просто вписан в список
+  relayOk: null,
+  relayProbe: null,
+  relaySince: 0,
+  candsAll: 0,
+  candsRelay: 0,
 };
 
 /** Как снимать и кодировать экран под разные задачи. */
@@ -1148,7 +1154,7 @@ function recoverStep(reason) {
   if (S.lastRecover && now - S.lastRecover < 12000) return;
   S.lastRecover = now;
 
-  if (!S.relayTried && S.iceTries >= 1 && hasRelay() && !S.forceRelay) {
+  if (!S.relayTried && S.iceTries >= 1 && hasRelay() && !S.forceRelay && S.relayOk !== false) {
     S.relayTried = true;
     setRelayOnly(true, false);
     S.iceTries = 0;
@@ -1382,6 +1388,10 @@ async function handleSignal(m) {
   switch (m.type) {
     case 'welcome':
       if (Array.isArray(m.iceServers) && m.iceServers.length) S.iceServers = m.iceServers;
+      // Проверку ретранслятора запускаем сразу и в фоне: она занимает до
+      // шести секунд, и ждать их в тот момент, когда связь уже не строится,
+      // — непозволительная роскошь. К моменту решения ответ будет готов.
+      if (hasRelay()) relayUsable();
       break;
 
     case 'joined':
@@ -1711,11 +1721,104 @@ function setRelayOnly(on, remember) {
   if (remember) prefs.set('forceRelay', on);
 }
 
+/**
+ * Ретранслятор, вписанный в список, и ретранслятор, который работает, —
+ * это разные вещи. Публичные бесплатные TURN живут недолго, чужой сервер
+ * может не пустить по учётным данным, а фаервол — не пустить до сервера.
+ *
+ * Проверяем честно: поднимаем пустое соединение в режиме «только
+ * ретранслятор» и смотрим, появится ли хоть один адрес типа relay.
+ * Появился — ретранслятором можно пользоваться. Не появился за шесть
+ * секунд или сбор адресов закончился ни с чем — нельзя, и переключаться
+ * на него нельзя тем более: это не запасной путь, а гарантированный тупик.
+ *
+ * Цена ошибки здесь высокая. Режим «только ретранслятор» отключает прямой
+ * путь целиком; если ретранслятор при этом мёртв, кандидатов не остаётся
+ * вообще никаких, ICE даже не начинает работу, и соединение навсегда
+ * замирает в состоянии new — ровно то, что видно в отчёте как «new / new»
+ * и пустой маршрут.
+ */
+function probeRelay() {
+  const servers = iceConfig().filter((srv) =>
+    [].concat(srv.urls || []).some((u) => /^turns?:/i.test(u))
+  );
+  if (!servers.length) return Promise.resolve(false);
+
+  return new Promise((resolve) => {
+    let pc;
+    let timer;
+    const done = (ok) => {
+      clearTimeout(timer);
+      try { pc?.close(); } catch {}
+      resolve(ok);
+    };
+    try {
+      pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'relay' });
+    } catch {
+      return resolve(false);
+    }
+    timer = setTimeout(() => done(false), 6000);
+    pc.addEventListener('icecandidate', (e) => {
+      if (!e.candidate) return done(false);          // сбор кончился, relay не нашёлся
+      if (/ typ relay/.test(e.candidate.candidate || '')) done(true);
+    });
+    try {
+      pc.createDataChannel('probe');
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => done(false));
+    } catch {
+      done(false);
+    }
+  });
+}
+
+/** Тот же вопрос, но с ответом наготове: проверяем один раз за звонок. */
+function relayUsable() {
+  if (S.relayOk !== null) return Promise.resolve(S.relayOk);
+  if (!S.relayProbe) {
+    S.relayProbe = probeRelay().then((ok) => {
+      S.relayOk = ok;
+      logEvent(ok ? 'good' : 'error',
+        ok ? 'Ретранслятор отвечает' : 'Ретранслятор не отвечает — отступать некуда');
+      return ok;
+    });
+  }
+  return S.relayProbe;
+}
+
 /** Есть ли куда отступать, если прямой путь не строится. */
 function hasRelay() {
   return iceConfig().some((srv) =>
     [].concat(srv.urls || []).some((u) => /^turns?:/i.test(u))
   );
+}
+
+/**
+ * Вернуться с ретранслятора на прямой путь.
+ *
+ * Переход на ретранслятор — шаг в один конец только на словах: если он не
+ * помог, оставаться в нём хуже, чем не переходить вовсе. Прямой путь при
+ * этом выключен, и звонок теряет последний шанс.
+ */
+function dropRelay(why) {
+  if (!S.forceRelay) return;
+  S.relayOk = false;
+  setRelayOnly(false, false);
+  logEvent('warn', `Ретранслятор не сработал (${why}) — возвращаюсь к прямому пути`);
+  toast('Ретранслятор не отвечает — пробую напрямую', 3200);
+  hardRestart(true, 'откат с ретранслятора');
+  noWayOut();
+}
+
+/**
+ * Прямой путь не строится, ретранслятора нет. Дальше пробовать нечего —
+ * честнее сказать это и подсказать, что делать, чем крутить попытки по
+ * кругу до конца времён.
+ */
+function noWayOut() {
+  if (S.noWayShown) return;
+  S.noWayShown = true;
+  logEvent('error', 'Ни прямого пути, ни ретранслятора: нужен свой TURN-сервер');
+  toast('Сети не дают соединиться напрямую, а рабочего ретранслятора нет. Впишите свой TURN-сервер в настройках — раздел «Связь».', 9000);
 }
 
 async function startPeerConnection() {
@@ -1734,6 +1837,8 @@ async function startPeerConnection() {
   });
   S.pc = pc;
   S.connectDeadline = performance.now() + 9000;
+  S.candsAll = 0;
+  S.candsRelay = 0;
   S.iceTries = 0;
   S.badSince = 0;
   S.offerAsked = 0;
@@ -1787,7 +1892,27 @@ async function startPeerConnection() {
   }
 
   pc.addEventListener('icecandidate', ({ candidate }) => {
-    if (candidate) signal({ candidate });
+    if (!candidate) return;
+    S.candsAll++;
+    if (/ typ relay/.test(candidate.candidate || '')) {
+      if (!S.candsRelay) logEvent('good', 'Нашёлся адрес ретранслятора');
+      S.candsRelay++;
+    }
+    signal({ candidate });
+  });
+
+  // Сбор адресов закончился. Если их не набралось ни одного, соединяться
+  // не с чем — и это надо сказать вслух, а не молча висеть в new.
+  pc.addEventListener('icegatheringstatechange', () => {
+    if (pc.iceGatheringState !== 'complete' || pc !== S.pc) return;
+    if (!S.candsAll) {
+      logEvent('error', 'Ни одного сетевого адреса не собрано');
+      if (S.forceRelay) dropRelay('ретранслятор не дал ни одного адреса');
+      return;
+    }
+    if (S.forceRelay && !S.candsRelay) {
+      dropRelay('в режиме ретранслятора адресов не нашлось');
+    }
   });
 
   pc.addEventListener('track', (e) => {
@@ -1874,6 +1999,7 @@ async function startPeerConnection() {
       case 'connected':
         clearTimeout(S.handshakeTimer);
         clearTimeout(S.negWatch);
+        clearTimeout(S.relayWatch);
         clearTimeout(S.netWatch);
         S.iceTries = 0;
         S.disconnectedAt = 0;
@@ -2078,11 +2204,31 @@ function watchHandshake() {
     const pc = S.pc;
     if (!pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
 
-    if (!S.forceRelay && hasRelay()) {
+    if (!S.forceRelay && hasRelay() && S.relayOk !== false) {
+      // Сначала убеждаемся, что ретранслятор живой. Уйти на мёртвый —
+      // значит отключить прямой путь и не получить взамен ничего.
+      const ok = await relayUsable();
+      if (!S.pc || S.pc !== pc) return;
+      if (!ok) {
+        noWayOut();
+        logEvent('warn', 'Рукопожатие затянулось — пробую заново');
+        try { pc.restartIce(); } catch {}
+        S.connectDeadline = performance.now() + 9000;
+        watchHandshake();
+        return;
+      }
       setRelayOnly(true, false);
+      S.relaySince = performance.now();
       logEvent('warn', 'Прямой путь не построился — иду через ретранслятор');
       toast('Прямое соединение не вышло — пробую через ретранслятор', 3200);
       await hardRestart(true, 'переход на ретранслятор');
+      // Не помог за двенадцать секунд — возвращаемся, пока не поздно
+      clearTimeout(S.relayWatch);
+      S.relayWatch = setTimeout(() => {
+        if (S.forceRelay && S.pc && S.pc.connectionState !== 'connected') {
+          dropRelay('связь через него так и не поднялась');
+        }
+      }, 12000);
       return;
     }
 
@@ -2136,6 +2282,30 @@ function watchNetwork() {
  */
 async function hardRestart(notify, reason) {
   if (S.restarting) return;
+
+  /*
+   * Защита от взаимной пересборки.
+   *
+   * Пересборка у себя всегда просит пересобраться и собеседника. Если у
+   * него в этот момент срабатывает собственный сторож, он присылает
+   * встречную просьбу — и обе стороны бесконечно сбрасывают друг другу
+   * едва начатое согласование. В журнале это выглядит как чередование
+   * «отправлено предложение» и «собеседник попросил пересобрать»: каждое
+   * предложение умирает раньше, чем на него успевают ответить.
+   *
+   * Поэтому просьбы, пришедшие сразу после своей же пересборки, мы
+   * пропускаем, а собственные автоматические — придерживаем. Ручная
+   * кнопка проходит всегда: её нажал человек, и он вправе настоять.
+   */
+  const now = performance.now();
+  const manual = reason === 'кнопка';
+  const quiet = manual ? 0 : notify ? 6000 : 9000;
+  if (quiet && S.lastRestart && now - S.lastRestart < quiet) {
+    logEvent('plain', `Пересборка (${reason || 'по команде'}) пропущена — только что пересобирались`);
+    return;
+  }
+  S.lastRestart = now;
+
   S.restarting = true;
   S.restarts++;
   logEvent('warn', `Пересобираю соединение (${reason || 'по команде'})`);
@@ -2886,6 +3056,11 @@ function diagnose(acc) {
   if (vpnish) {
     out.push(`Адрес <b>${addr}</b> похож на VPN или виртуальную сеть. Если звонок не через неё, отключите VPN — станет заметно лучше.`);
   }
+  // Пока разговор идёт, отсутствие ретранслятора никого не касается:
+  // говорить о запасном пути имеет смысл только когда основной подвёл.
+  if (S.relayOk === false && S.pc?.connectionState !== 'connected') {
+    out.push('Рабочего ретранслятора нет: публичный не отвечает, свой не задан. Если прямой путь между вами не строится, соединиться будет нечем — впишите свой TURN-сервер в настройках.');
+  }
   if (S.bwe != null && S.bwe < 500_000) {
     out.push(`Канал сейчас <b>${Math.round(S.bwe / 1000)} кбит/с</b> — этого хватает на голос и небольшую картинку. Качество уже опущено под него автоматически.`);
   }
@@ -3565,6 +3740,7 @@ window.__zvDebug = {
   adaptQuality, applySendParams, reconnect, diagnose, tuneSdp,
   preferCamCodec, preferAudioCodec, camCodecOrder, hasRelay, targetBuffer,
   logReport, recoverStep, setRelayOnly, pacePolling, sendOffer, watchNegotiation,
+  probeRelay, relayUsable, dropRelay, hardRestart, noWayOut,
   videoBudget, rungForBudget, watchFrames, forceKeyframe,
   LADDER, SHARE_PRESETS, PLATFORM,
   log: () => LOG.slice(),
