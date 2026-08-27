@@ -173,10 +173,12 @@
       <span>Камера</span>
       <select id="camSelect"></select>
     </label>
-    <label class="field" id="spkField">
+    <div class="field" id="spkField">
       <span>Наушники или динамик</span>
       <select id="spkSelect"></select>
-    </label>
+      <button class="btn btn--wide" id="spkAskBtn" type="button" hidden>Выбрать устройство</button>
+      <p class="field__note" id="spkNote" hidden></p>
+    </div>
 
     <div class="probe" id="probe">
       <h3>Проверка звука</h3>
@@ -243,6 +245,8 @@
       </dl>
       <p>Работают и в русской раскладке.</p>
     </details>
+
+    <p class="build" id="buildStamp"></p>
   </section>
 
   <!-- Панель управления -->

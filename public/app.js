@@ -6,6 +6,9 @@
 
 const $ = (id) => document.getElementById(id);
 
+/** Видно в настройках: помогает понять, не подсунул ли браузер старую версию. */
+const BUILD = '2026-08-27';
+
 /**
  * Порядок трансиверов фиксирован и одинаков на обеих сторонах, поэтому
  * входящую дорожку можно опознать по её месту: 0 — микрофон, 1 — камера,
@@ -217,15 +220,15 @@ const tileVideo = (id) => tileEl(id).querySelector('video');
 
 async function listDevices() {
   let devices = [];
-  try { devices = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch {
+    return;
+  }
 
   fillSelect($('micSelect'), devices.filter((d) => d.kind === 'audioinput'), 'Микрофон');
   fillSelect($('camSelect'), devices.filter((d) => d.kind === 'videoinput'), 'Камера');
-
-  const outputs = devices.filter((d) => d.kind === 'audiooutput');
-  const canPick = typeof tileVideo('remote-cam').setSinkId === 'function' && outputs.length > 0;
-  $('spkField').hidden = !canPick;
-  if (canPick) fillSelect($('spkSelect'), outputs, 'Устройство');
+  renderOutputs(devices.filter((d) => d.kind === 'audiooutput'));
 
   // Текущие устройства отмечаем в списках
   const micId = S.local.mic?.getSettings().deviceId;
@@ -233,6 +236,63 @@ async function listDevices() {
   if (micId) $('micSelect').value = micId;
   if (camId) $('camSelect').value = camId;
 }
+
+const canSetSink = () =>
+  typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+
+/**
+ * Список динамиков ведёт себя по-разному: Chrome отдаёт его сразу после
+ * разрешения на микрофон, Firefox — только по явному запросу, Safari не
+ * умеет переключать вывод вовсе. Раньше поле просто исчезало и выглядело
+ * как пропавшая функция; теперь всегда объясняем, что происходит.
+ */
+function renderOutputs(outputs) {
+  const field = $('spkField');
+  const select = $('spkSelect');
+  const ask = $('spkAskBtn');
+  const note = $('spkNote');
+
+  field.hidden = false;
+  select.hidden = true;
+  ask.hidden = true;
+  note.hidden = true;
+  note.className = 'field__note';
+
+  if (!canSetSink()) {
+    note.hidden = false;
+    note.className = 'field__note is-warn';
+    note.textContent = 'Этот браузер не умеет переключать вывод звука. Смените устройство по умолчанию в настройках системы.';
+    return;
+  }
+
+  if (outputs.length) {
+    fillSelect(select, outputs, 'Устройство');
+    if (S.sinkId && outputs.some((d) => d.deviceId === S.sinkId)) select.value = S.sinkId;
+    select.hidden = false;
+    return;
+  }
+
+  if (typeof navigator.mediaDevices?.selectAudioOutput === 'function') {
+    ask.hidden = false;
+    note.hidden = false;
+    note.textContent = 'Браузер показывает список динамиков только по запросу.';
+    return;
+  }
+
+  note.hidden = false;
+  note.className = 'field__note is-warn';
+  note.textContent = 'Устройства вывода не найдены. Обычно список появляется после разрешения на микрофон — проверьте, что наушники подключены, и обновите страницу.';
+}
+
+$('spkAskBtn').addEventListener('click', async () => {
+  try {
+    const device = await navigator.mediaDevices.selectAudioOutput();
+    if (device?.deviceId) await setSink(device.deviceId);
+    listDevices();
+  } catch {
+    /* пользователь закрыл выбор */
+  }
+});
 
 function fillSelect(select, devices, fallback) {
   const current = select.value;
@@ -1390,6 +1450,7 @@ bindSwitch('echoCancel', 'echoCancel', () => applyAudioProcessing(true));
 bindSwitch('autoGain', 'autoGain', () => applyAudioProcessing(true));
 
 $('reconnectBtn').addEventListener('click', () => reconnect());
+$('buildStamp').textContent = 'Сборка от ' + BUILD;
 
 /* ─────────────── Экраны ─────────────── */
 

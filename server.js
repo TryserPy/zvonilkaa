@@ -110,9 +110,11 @@ function sendAsset(req, res, filePath) {
     Vary: 'Accept-Encoding',
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
-    'Cache-Control': filePath.endsWith('.html')
-      ? 'no-cache'
-      : 'public, max-age=86400, must-revalidate',
+    // Всё отдаём с обязательной проверкой свежести. Раньше скрипты и стили
+    // кэшировались на сутки, и после обновления браузер собирал франкенштейна
+    // из новой разметки и старого кода — приложение падало на ровном месте.
+    // ETag делает проверку дешёвой: почти всегда это пустой ответ 304.
+    'Cache-Control': 'no-cache',
   };
 
   if (req.headers['if-none-match'] === asset.etag) {
