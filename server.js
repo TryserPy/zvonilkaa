@@ -85,25 +85,13 @@ function iceServers() {
     });
   }
 
-  // Запасной ретранслятор. Без него пара «один за строгим NAT, другой под
-  // VPN» не соединяется вообще никак: прямой путь между ними не строится
-  // физически. Публичный, бесплатный, без гарантий — но лучше медленное
-  // соединение, чем никакого. Порты 80 и 443 выбраны нарочно: их не режут
-  // там, где режут всё остальное, а вариант с TCP проходит через сети,
-  // где UDP закрыт целиком.
-  if (process.env.TURN_FALLBACK !== 'off' && !process.env.TURN_URL) {
-    list.push({
-      urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turn:staticauth.openrelay.metered.ca:80',
-        'turn:staticauth.openrelay.metered.ca:443?transport=tcp',
-      ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    });
-  }
+  // Публичного запасного ретранслятора здесь нет намеренно. Бесплатные
+  // общедоступные TURN живут недолго: тот, что стоял тут раньше, отвечал
+  // на запросы ошибкой 400, засорял журнал и, хуже того, выглядел рабочим
+  // — приложение уходило на него и теряло прямой путь. Лучше честно не
+  // иметь ретранслятора, чем иметь несуществующий: тогда и подсказка
+  // «впишите свой TURN» появляется вовремя. Свой задаётся переменными
+  // окружения или полем в настройках, см. README.
 
   return list;
 }
@@ -475,10 +463,24 @@ wss.on('connection', (ws, req) => {
           return send(ws, 'room-full', { roomId: msg.roomId });
         }
 
-        // Первый в комнате — «невежливый» пир: при коллизии офферов
-        // его предложение выигрывает (perfect negotiation).
-        const polite = room.size > 0;
+        /*
+         * Роли для perfect negotiation. Ровно один из двоих должен быть
+         * «невежливым» — при столкновении предложений выигрывает его.
+         *
+         * Раньше роль давалась по порядку входа: первый невежливый, второй
+         * вежливый. Порядок, однако, живёт не дольше соединения: стоит
+         * первому переподключиться, и он входит вторым — то есть вежливым.
+         * А второй, никуда не уходивший, вежливым и остался. Двое вежливых
+         * бесконечно уступают друг другу, и согласование не начинается
+         * никогда.
+         *
+         * Поэтому роль считается от самих имён: у кого имя больше, тот и
+         * вежливый. Сравнение не зависит ни от порядка, ни от времени, и
+         * обе стороны всегда приходят к противоположным ответам.
+         */
         const others = [...room.keys()];
+        const other = others[0];
+        const polite = other ? ws.peerId > other : false;
 
         room.set(ws.peerId, ws);
         rooms.set(msg.roomId, room);
@@ -486,7 +488,7 @@ wss.on('connection', (ws, req) => {
 
         send(ws, 'joined', { roomId: msg.roomId, peerId: ws.peerId, polite, peers: others });
         for (const [id, peer] of room) {
-          if (id !== ws.peerId) send(peer, 'peer-joined', { peerId: ws.peerId });
+          if (id !== ws.peerId) send(peer, 'peer-joined', { peerId: ws.peerId, polite: id > ws.peerId });
         }
         break;
       }

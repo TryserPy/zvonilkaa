@@ -402,7 +402,12 @@ function logReport() {
     'Пинг: ' + (S.rtts.length ? summarizeRtt() : '—'),
     'Разброс пинга: ' + (S.rttEma == null ? '—' : '±' + Math.round(S.rttVar) + ' мс'),
     'Потери: ' + (S.lossEma || 0).toFixed(1) + ' %',
-    'Ретранслятор: ' + (S.forceRelay ? 'принудительно' : hasRelay() ? 'доступен' : 'нет'),
+    'Ретранслятор: ' + (
+      S.forceRelay ? 'принудительно'
+      : S.relayOk === true ? 'отвечает'
+      : S.relayOk === false ? 'не отвечает'
+      : hasRelay() ? 'задан, ещё не проверен'
+      : 'не задан'),
     'Пересборок: ' + S.restarts,
     '',
   ].join('\n');
@@ -736,19 +741,41 @@ function attachRemote() {
  * показываем кнопку.
  */
 async function playRemoteAudio() {
-  let blocked = false;
-  for (const el of audioEls()) {
-    if (!el.srcObject) continue;
+  /*
+   * Тонкость, которая стоила кнопке работоспособности.
+   *
+   * play() у элемента, в который ещё не пришло ни одного кадра, не
+   * отклоняется и не выполняется — он просто ждёт начала воспроизведения.
+   * Плитка демонстрации существует всегда, а показывают экран далеко не
+   * всегда: дорожки в ней есть, данных в них нет. Обещание висит вечно.
+   *
+   * Раньше элементы обходились по очереди с await на каждом. Первый же
+   * такой элемент останавливал всю функцию: до строчки, которая прячет
+   * кнопку, дело не доходило никогда. Со стороны это выглядело ровно так,
+   * как человек и описал: «зелёная кнопка не жмётся» — звук при этом
+   * честно включался, просто кнопка оставалась висеть.
+   *
+   * Поэтому: все элементы разом, и у каждого своё терпение.
+   */
+  const tries = audioEls().map(async (el) => {
+    if (!el.srcObject) return false;
     el.muted = !S.speakerOn;
     el.volume = 1;
     try {
-      await el.play();
+      await Promise.race([
+        el.play(),
+        new Promise((resolve) => setTimeout(resolve, 1200)),
+      ]);
+      return false;
     } catch (err) {
-      if (err?.name === 'NotAllowedError') blocked = true;
+      return err?.name === 'NotAllowedError';
     }
-  }
+  });
+
+  const blocked = (await Promise.all(tries)).some(Boolean);
   S.soundBlocked = blocked;
   $('soundGate').hidden = !(blocked && S.speakerOn);
+  return !blocked;
 }
 
 $('soundGate').addEventListener('click', async () => {
@@ -1398,7 +1425,25 @@ async function handleSignal(m) {
       logEvent('good', `Вошли в комнату, собеседников: ${m.peers.length}, роль: ${m.polite ? 'ведомая' : 'ведущая'}`);
       S.peerId = m.peerId;
       S.polite = m.polite;
-      if (m.peers.length) { S.peerPresent = true; await startPeerConnection(); refreshUi(); }
+      if (m.peers.length) {
+        S.peerPresent = true;
+        // Живое соединение переживает переподключение сигналинга: служебный
+        // канал моргнул, а разговор шёл и идёт. Тревожить собеседника в
+        // этом случае нечем — пересобирать нужно только по-настоящему
+        // свежему участнику.
+        const hadLive = S.pc && S.pc.connectionState === 'connected';
+        await startPeerConnection();
+        /*
+         * Мы входим в уже идущий разговор — значит, наше соединение
+         * построено с нуля, а у собеседника осталось прежнее: с адресами
+         * и ключами той вкладки, которой больше нет. Его ICE об этом не
+         * знает и продолжает стучаться в пустоту, а переговоры поверх
+         * мёртвого транспорта не помогают. Поэтому сразу говорим: собери
+         * заново. Себя пересобирать не нужно — мы и так свежие.
+         */
+        if (!hadLive) signal({ ctl: 'restart', fresh: true });
+        refreshUi();
+      }
       else { setStatus('connecting', 'Ждём собеседника'); setInvite(true); }
       break;
 
@@ -1407,6 +1452,14 @@ async function handleSignal(m) {
       const returning = !!S.leaveTimer;
       clearTimeout(S.leaveTimer);
       S.leaveTimer = null;
+
+      // Сервер пересчитывает роли при каждом изменении состава комнаты.
+      // Без этого после переподключения обе стороны могли оказаться
+      // ведомыми — и вежливо ждать друг друга до конца времён.
+      if (typeof m.polite === 'boolean' && m.polite !== S.polite) {
+        S.polite = m.polite;
+        logEvent('plain', `Роль сменилась на ${m.polite ? 'ведомую' : 'ведущую'}`);
+      }
 
       if (returning && S.pc?.connectionState === 'connected') {
         logEvent('good', 'Собеседник вернулся, связь не рвалась');
@@ -1422,6 +1475,7 @@ async function handleSignal(m) {
       setInvite(false);
       beep(660);
       addSystemMessage('Собеседник присоединился');
+
       await startPeerConnection();
       sendState();
       refreshUi();
@@ -1495,8 +1549,13 @@ async function onRemoteSignal(payload) {
   }
 
   if (data.ctl === 'restart') {
-    logEvent('warn', 'Собеседник попросил пересобрать соединение');
-    await hardRestart(false, 'по просьбе собеседника');
+    if (data.fresh) {
+      logEvent('warn', 'Собеседник вошёл заново — пересобираю соединение');
+      await hardRestart(false, 'собеседник вошёл заново');
+    } else {
+      logEvent('warn', 'Собеседник попросил пересобрать соединение');
+      await hardRestart(false, 'по просьбе собеседника');
+    }
     return;
   }
 
@@ -2298,7 +2357,7 @@ async function hardRestart(notify, reason) {
    * кнопка проходит всегда: её нажал человек, и он вправе настоять.
    */
   const now = performance.now();
-  const manual = reason === 'кнопка';
+  const manual = reason === 'кнопка' || reason === 'собеседник вошёл заново';
   const quiet = manual ? 0 : notify ? 6000 : 9000;
   if (quiet && S.lastRestart && now - S.lastRestart < quiet) {
     logEvent('plain', `Пересборка (${reason || 'по команде'}) пропущена — только что пересобирались`);
@@ -2468,8 +2527,23 @@ async function collectStats() {
   const byId = new Map();
   report.forEach((r) => byId.set(r.id, r));
 
+  /*
+   * Успешных пар адресов бывает несколько — ICE держит запасные наготове.
+   * Работает при этом ровно одна, и именно её надо показывать. Раньше
+   * бралась последняя попавшаяся, и журнал каждую секунду сообщал о
+   * «смене сетевого пути» между двумя парами, которые никуда не менялись.
+   * Браузер сам говорит, какая пара выбрана: у транспорта есть ссылка на
+   * неё, а в Firefox у самой пары стоит признак selected.
+   */
+  let chosenPair = null;
   report.forEach((r) => {
-    if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) {
+    if (r.type === 'transport' && r.selectedCandidatePairId) chosenPair = r.selectedCandidatePairId;
+    if (r.type === 'candidate-pair' && r.selected) chosenPair = chosenPair || r.id;
+  });
+
+  report.forEach((r) => {
+    if (r.type === 'candidate-pair' &&
+        (chosenPair ? r.id === chosenPair : (r.nominated || r.state === 'succeeded'))) {
       if (r.currentRoundTripTime != null) acc.rtt = r.currentRoundTripTime * 1000;
       // Оценка пропускной способности. Есть в Chrome и всех, кто на нём
       // построен; в Safari и Firefox поля просто нет.
