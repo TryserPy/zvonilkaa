@@ -42,11 +42,20 @@ const S = {
   main: null,
   mainLocked: false,
   remoteState: { mic: true, cam: false, screen: false },
+  remoteKnown: false,
 
   lowLatency: false,
   shareAudio: true,
   mirror: true,
+  noiseSuppress: true,
+  echoCancel: true,
+  autoGain: true,
   sinkId: '',
+  soundBlocked: false,
+  audioProcFixed: false,
+  speakingSelf: false,
+  tick: 0,
+  lastRecover: 0,
 
   makingOffer: false,
   ignoreOffer: false,
@@ -54,7 +63,7 @@ const S = {
 
   statsTimer: null,
   prev: null,
-  quality: 0,
+  quality: 1,
   qualityHold: 0,
   wakeLock: null,
   fingerprint: null,
@@ -131,12 +140,12 @@ $('themeToggle').addEventListener('click', () => {
    МЕДИА
    ═══════════════════════════════════════════════════════════════════ */
 
-const AUDIO_CONSTRAINTS = {
-  echoCancellation: true,
-  noiseSuppression: true,
-  autoGainControl: true,
+const audioConstraints = () => ({
+  echoCancellation: S.echoCancel,
+  noiseSuppression: S.noiseSuppress,
+  autoGainControl: S.autoGain,
   channelCount: 1,
-};
+});
 
 const videoConstraints = (facing) => ({
   width: { ideal: 1280 },
@@ -154,9 +163,9 @@ async function ensureMedia() {
   }
 
   const attempts = [
-    { audio: AUDIO_CONSTRAINTS, video: videoConstraints(S.facing) },
-    { audio: AUDIO_CONSTRAINTS, video: true },
-    { audio: AUDIO_CONSTRAINTS, video: false },
+    { audio: audioConstraints(), video: videoConstraints(S.facing) },
+    { audio: audioConstraints(), video: true },
+    { audio: audioConstraints(), video: false },
   ];
 
   for (const c of attempts) {
@@ -214,7 +223,7 @@ async function listDevices() {
   fillSelect($('camSelect'), devices.filter((d) => d.kind === 'videoinput'), 'Камера');
 
   const outputs = devices.filter((d) => d.kind === 'audiooutput');
-  const canPick = typeof $('remoteAudio').setSinkId === 'function' && outputs.length > 0;
+  const canPick = typeof tileVideo('remote-cam').setSinkId === 'function' && outputs.length > 0;
   $('spkField').hidden = !canPick;
   if (canPick) fillSelect($('spkSelect'), outputs, 'Устройство');
 
@@ -243,7 +252,7 @@ async function switchDevice(kind, deviceId) {
   try {
     const constraints =
       kind === 'audio'
-        ? { audio: { ...AUDIO_CONSTRAINTS, deviceId: { exact: deviceId } } }
+        ? { audio: { ...audioConstraints(), deviceId: { exact: deviceId } } }
         : { video: { ...videoConstraints(S.facing), deviceId: { exact: deviceId } } };
 
     const fresh = await navigator.mediaDevices.getUserMedia(constraints);
@@ -277,10 +286,138 @@ $('spkSelect').addEventListener('change', (e) => setSink(e.target.value));
 async function setSink(deviceId) {
   S.sinkId = deviceId;
   prefs.set('sink', deviceId);
-  for (const el of [$('remoteAudio'), $('remoteScreenAudio')]) {
+  for (const el of audioEls()) {
     try { await el.setSinkId(deviceId); } catch {}
   }
   toast('Звук выводится на выбранное устройство', 1600);
+}
+
+/* ─────────────── Воспроизведение звука ─────────────── */
+
+/*
+ * Звук собеседника воспроизводится тем же элементом, что и его видео.
+ * Отдельный <audio> выглядел аккуратнее, но Safari на iOS через него
+ * молчит — это была причина «меня никто не слышит».
+ */
+const audioEls = () => [tileVideo('remote-cam'), tileVideo('remote-screen')];
+
+const remoteTracks = { mic: null, cam: null, screen: null, screenAudio: null };
+
+/** Пересобирает потоки удалённых плиток из пришедших дорожек. */
+function attachRemote() {
+  const pairs = [
+    ['remote-cam', remoteTracks.cam, remoteTracks.mic],
+    ['remote-screen', remoteTracks.screen, remoteTracks.screenAudio],
+  ];
+
+  for (const [id, video, audio] of pairs) {
+    const el = tileVideo(id);
+    const tracks = [video, audio].filter(Boolean);
+    if (!tracks.length) continue;
+
+    const current = el.srcObject ? el.srcObject.getTracks() : [];
+    const same = current.length === tracks.length && tracks.every((t) => current.includes(t));
+    if (!same) el.srcObject = new MediaStream(tracks);
+
+    el.muted = !S.speakerOn;
+    el.playsInline = true;
+    if (S.sinkId && el.setSinkId) el.setSinkId(S.sinkId).catch(() => {});
+  }
+}
+
+/**
+ * Браузер не даёт запустить звук, пока по странице не кликнули. Раньше
+ * звук ехал вместе с видео и проблема не проявлялась; теперь дорожки
+ * разные, поэтому запускаем воспроизведение вручную и, если заблокировано,
+ * показываем кнопку.
+ */
+async function playRemoteAudio() {
+  let blocked = false;
+  for (const el of audioEls()) {
+    if (!el.srcObject) continue;
+    el.muted = !S.speakerOn;
+    el.volume = 1;
+    try {
+      await el.play();
+    } catch (err) {
+      if (err?.name === 'NotAllowedError') blocked = true;
+    }
+  }
+  S.soundBlocked = blocked;
+  $('soundGate').hidden = !(blocked && S.speakerOn);
+}
+
+$('soundGate').addEventListener('click', async () => {
+  try { await audioCtx?.resume(); } catch {}
+  await playRemoteAudio();
+  if (!S.soundBlocked) toast('Звук включён');
+});
+
+/* ─────────────── Обработка микрофона ─────────────── */
+
+/**
+ * Шумоподавление и эхоподавление живут в самом треке. Chrome умеет менять
+ * их на лету, остальные — только пересозданием дорожки.
+ */
+async function applyAudioProcessing(announce) {
+  const track = S.local.mic;
+  if (!track) return;
+  const wanted = {
+    echoCancellation: S.echoCancel,
+    noiseSuppression: S.noiseSuppress,
+    autoGainControl: S.autoGain,
+  };
+
+  const reflects = (t) => {
+    const got = t.getSettings();
+    // Часть устройств просто не сообщает эти поля — считаем, что применилось
+    if (got.noiseSuppression === undefined) return true;
+    return got.noiseSuppression === S.noiseSuppress;
+  };
+
+  let failed = false;
+  try {
+    await track.applyConstraints(wanted);
+  } catch {
+    failed = true;
+  }
+
+  if (!failed && reflects(track)) {
+    if (announce) toast(S.noiseSuppress ? 'Шумоподавление включено' : 'Шумоподавление выключено', 1600);
+    return;
+  }
+
+  // Пересоздаём дорожку только если это вообще помогает: некоторые
+  // устройства не поддерживают обработку и всегда рапортуют своё,
+  // и тогда бесконечно пересоздавать микрофон бессмысленно.
+  if (S.audioProcFixed) {
+    if (announce) toast('Устройство не поддерживает эту настройку', 2200);
+    return;
+  }
+
+  try {
+    const deviceId = track.getSettings().deviceId;
+    const fresh = await navigator.mediaDevices.getUserMedia({
+      audio: deviceId
+        ? { ...wanted, channelCount: 1, deviceId: { exact: deviceId } }
+        : { ...wanted, channelCount: 1 },
+    });
+    const next = fresh.getAudioTracks()[0];
+    next.enabled = S.micOn;
+    try { next.contentHint = 'speech'; } catch {}
+
+    if (S.send.mic) await S.send.mic.replaceTrack(next);
+    S.camStream.removeTrack(track);
+    track.stop();
+    S.camStream.addTrack(next);
+    S.local.mic = next;
+    watchLevel('self', S.camStream, true);
+
+    if (!reflects(next)) S.audioProcFixed = true;
+    if (announce) toast('Настройки микрофона применены', 1600);
+  } catch {
+    if (announce) toast('Не удалось изменить настройки микрофона');
+  }
 }
 
 /* ─────────────── Индикатор речи ─────────────── */
@@ -342,13 +479,19 @@ function onLevel(who, level) {
   if (who !== 'self') return;
   const pct = Math.round(level * 100);
   $('previewMeter').firstElementChild.style.width = pct + '%';
+  $('probeMic').style.width = pct + '%';
   $('micBtn').style.setProperty('--lvl', level.toFixed(2));
   $('micBtn').style.setProperty('--lvlop', level > 0.04 ? '1' : '0');
+  if (level > 0.05) S.micHeard = true;
 }
 
 function onSpeak(who, on) {
   const id = who === 'self' ? 'local-cam' : 'remote-cam';
   tileEl(id)?.classList.toggle('is-speaking', on);
+  if (who === 'self') {
+    S.speakingSelf = on;
+    sendState(); // собеседник узнаёт о речи от нас, а не разбирая наш звук
+  }
 }
 
 /* ─────────────── Переключатели ─────────────── */
@@ -369,7 +512,9 @@ function setCam(on) {
 
 function setSpeaker(on) {
   S.speakerOn = on;
-  for (const el of [$('remoteAudio'), $('remoteScreenAudio')]) el.muted = !on;
+  for (const el of audioEls()) el.muted = !on;
+  if (on) playRemoteAudio();
+  else $('soundGate').hidden = true;
   refreshUi();
 }
 
@@ -443,6 +588,81 @@ async function stopShare() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   ЖИВОСТЬ ВИДЕО
+   ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * Раньше картинка собеседника показывалась только по служебному сообщению
+ * о состоянии. Если оно терялось, живое видео пряталось под заглушкой и
+ * выглядело как зависание. Теперь ориентируемся на настоящие кадры.
+ */
+const frames = { cam: { at: 0, mark: -1 }, screen: { at: 0, mark: -1 } };
+let framesTimer = null;
+
+/**
+ * Счётчик декодированных кадров. Именно он показывает, идёт ли картинка:
+ * currentTime у медиапотока тикает по часам элемента даже когда кадров нет.
+ */
+function frameCount(video) {
+  try {
+    if (typeof video.getVideoPlaybackQuality === 'function') {
+      return video.getVideoPlaybackQuality().totalVideoFrames;
+    }
+  } catch {}
+  if (typeof video.webkitDecodedFrameCount === 'number') return video.webkitDecodedFrameCount;
+  return null;
+}
+
+function pollFrames() {
+  let changed = false;
+  for (const role of ['cam', 'screen']) {
+    const v = tileVideo(role === 'cam' ? 'remote-cam' : 'remote-screen');
+    const w = frames[role];
+    const was = isLive(role);
+
+    const n = frameCount(v);
+    if (n === null) {
+      // Браузер не умеет считать кадры — довольствуемся размером картинки
+      if (v.srcObject && v.videoWidth > 0 && !v.paused) w.at = performance.now();
+    } else if (w.mark < 0) {
+      w.mark = n; // первая проба: запоминаем, но живым ещё не считаем
+    } else if (n > w.mark) {
+      w.mark = n;
+      w.at = performance.now();
+    }
+
+    if (isLive(role) !== was) changed = true;
+  }
+  if (changed) refreshUi();
+}
+
+const isLive = (role) => frames[role].at > 0 && performance.now() - frames[role].at < 2500;
+
+function startFrameWatch() {
+  stopFrameWatch();
+  framesTimer = setInterval(pollFrames, 500);
+}
+function stopFrameWatch() {
+  clearInterval(framesTimer);
+  framesTimer = null;
+  frames.cam = { at: 0, mark: -1 };
+  frames.screen = { at: 0, mark: -1 };
+}
+
+/** Пересобрать соединение, если картинка замерла или связь развалилась. */
+function reconnect(reason) {
+  if (!S.pc) return toast('Соединения нет — ждём собеседника');
+  S.lastRecover = performance.now();
+  try {
+    S.pc.restartIce();
+    setStatus('connecting', 'Переподключение…');
+    toast(reason || 'Переподключаю связь', 2000);
+  } catch {
+    toast('Не удалось переподключиться');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    РАСКЛАДКА
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -450,7 +670,7 @@ const TILE_LIVE = {
   'local-cam': () => !!S.camStream,
   'local-screen': () => S.sharing,
   'remote-cam': () => S.peerPresent,
-  'remote-screen': () => S.peerPresent && S.remoteState.screen,
+  'remote-screen': () => S.peerPresent && (S.remoteState.screen || isLive('screen')),
 };
 
 // Что показывать крупно, если пользователь ещё не выбрал сам
@@ -510,7 +730,7 @@ function refreshUi() {
     // Затемнение, когда видео нет
     const dark =
       (id === 'local-cam' && !camLive) ||
-      (id === 'remote-cam' && !S.remoteState.cam);
+      (id === 'remote-cam' && !(S.remoteKnown ? S.remoteState.cam : isLive('cam')));
     el.classList.toggle('is-dark', dark);
   }
 
@@ -560,6 +780,7 @@ function sendState() {
       mic: S.micOn && !!S.local.mic,
       cam: (S.camOn && !!S.local.cam) || false,
       screen: S.sharing,
+      speaking: !!S.speakingSelf && S.micOn,
     },
   });
 }
@@ -606,6 +827,8 @@ async function onRemoteSignal(data) {
 
   if (data.state) {
     S.remoteState = { ...S.remoteState, ...data.state };
+    S.remoteKnown = true;
+    onSpeak('peer', !!data.state.speaking);
     refreshUi();
     return;
   }
@@ -749,25 +972,10 @@ async function startPeerConnection() {
     const role = ROLES[index];
     if (!role) return;
 
-    const stream = new MediaStream([e.track]);
-    S.remote[role] = stream;
-
-    if (role === 'mic') {
-      $('remoteAudio').srcObject = stream;
-      $('remoteAudio').muted = !S.speakerOn;
-      if (S.sinkId) $('remoteAudio').setSinkId?.(S.sinkId).catch(() => {});
-      watchLevel('peer', stream, true);
-    } else if (role === 'screenAudio') {
-      $('remoteScreenAudio').srcObject = stream;
-      $('remoteScreenAudio').muted = !S.speakerOn;
-      if (S.sinkId) $('remoteScreenAudio').setSinkId?.(S.sinkId).catch(() => {});
-    } else {
-      const video = tileVideo(role === 'cam' ? 'remote-cam' : 'remote-screen');
-      video.muted = true;
-      video.srcObject = stream;
-      video.play?.().catch(() => {});
-    }
-
+    remoteTracks[role] = e.track;
+    S.remote[role] = e.track;
+    attachRemote();
+    playRemoteAudio();
     applyLatency();
     refreshUi();
   });
@@ -776,21 +984,23 @@ async function startPeerConnection() {
     if (pc.iceConnectionState === 'failed') {
       setStatus('bad', 'Восстановление связи…');
       try { pc.restartIce(); } catch {}
+    } else if (pc.iceConnectionState === 'connected') {
+      syncStatus();
     }
   });
 
   pc.addEventListener('connectionstatechange', () => {
     switch (pc.connectionState) {
       case 'connected':
-        setStatus('live', 'Соединение установлено');
+        syncStatus();
         setInvite(false);
         applySendParams();
         applyLatency();
+        applyAudioProcessing();
+        playRemoteAudio();
         sendState();
         break;
-      case 'connecting': setStatus('connecting', 'Подключение…'); break;
-      case 'disconnected': setStatus('bad', 'Связь нестабильна'); break;
-      case 'failed': setStatus('bad', 'Связь потеряна'); break;
+      default: syncStatus();
     }
   });
 
@@ -846,11 +1056,13 @@ function applyLatency() {
 function onPeerLeft() {
   S.peerPresent = false;
   S.remoteState = { mic: true, cam: false, screen: false };
+  S.remoteKnown = false;
   for (const id of ['remote-cam', 'remote-screen']) tileVideo(id).srcObject = null;
-  $('remoteAudio').srcObject = null;
-  $('remoteScreenAudio').srcObject = null;
-  meters.peer?.stop();
-  delete meters.peer;
+  for (const k of Object.keys(remoteTracks)) remoteTracks[k] = null;
+  onSpeak('peer', false);
+  frames.cam = { at: 0, mark: -1 };
+  frames.screen = { at: 0, mark: -1 };
+  $('soundGate').hidden = true;
 
   $('stageEmptyText').textContent = 'Собеседник вышел';
   setInvite(true);
@@ -871,6 +1083,25 @@ function onPeerLeft() {
 function setStatus(kind, text) {
   $('statusDot').className = 'dot is-' + kind;
   $('statusText').textContent = text;
+}
+
+/**
+ * Статус вычисляется из состояния соединения, а не выставляется вручную:
+ * иначе после переподключения надпись «Переподключение…» висела вечно,
+ * потому что connectionState не менялся и событие не приходило.
+ */
+function syncStatus() {
+  const pc = S.pc;
+  if (!pc) return;
+  if (!S.peerPresent) return setStatus('connecting', 'Ждём собеседника');
+
+  switch (pc.connectionState) {
+    case 'connected': setStatus('live', 'Соединение установлено'); break;
+    case 'new':
+    case 'connecting': setStatus('connecting', 'Подключение…'); break;
+    case 'disconnected': setStatus('bad', 'Связь нестабильна'); break;
+    case 'failed': setStatus('bad', 'Связь потеряна'); break;
+  }
 }
 
 function startStats() {
@@ -896,6 +1127,7 @@ async function collectStats() {
   const acc = {
     rtt: null, jitter: null, buffer: null,
     inBytes: 0, outBytes: 0,
+    audioIn: 0, audioOut: 0, videoInFrames: 0,
     width: 0, height: 0, fps: 0,
     codec: null, route: null, srtp: null, dtls: null,
     localFp: null, remoteFp: null,
@@ -929,6 +1161,7 @@ async function collectStats() {
       acc.packetsLost += r.packetsLost || 0;
       acc.packetsRecv += r.packetsReceived || 0;
       acc.inBytes += r.bytesReceived || 0;
+      if (r.kind === 'audio') acc.audioIn += r.bytesReceived || 0;
       if (r.jitter != null) acc.jitter = Math.max(acc.jitter ?? 0, r.jitter * 1000);
 
       if (r.kind === 'audio' && r.jitterBufferDelay != null && r.jitterBufferEmittedCount) {
@@ -944,7 +1177,10 @@ async function collectStats() {
       }
     }
 
-    if (r.type === 'outbound-rtp' && !r.isRemote) acc.outBytes += r.bytesSent || 0;
+    if (r.type === 'outbound-rtp' && !r.isRemote) {
+      acc.outBytes += r.bytesSent || 0;
+      if (r.kind === 'audio') acc.audioOut += r.bytesSent || 0;
+    }
 
     if (r.type === 'transport') {
       acc.dtls = r.dtlsCipher || acc.dtls;
@@ -958,23 +1194,86 @@ async function collectStats() {
 
   if (acc.bufferCount) acc.buffer = (acc.bufferDelay / acc.bufferCount) * 1000;
 
-  let inBps = 0, outBps = 0, lossPct = 0;
+  let inBps = 0, outBps = 0, lossPct = 0, audioInBps = 0, audioOutBps = 0;
   if (S.prev) {
     const dt = (now - S.prev.t) / 1000;
     if (dt > 0.2) {
       inBps = Math.max(0, ((acc.inBytes - S.prev.in) * 8) / dt);
       outBps = Math.max(0, ((acc.outBytes - S.prev.out) * 8) / dt);
+      audioInBps = Math.max(0, ((acc.audioIn - S.prev.aIn) * 8) / dt);
+      audioOutBps = Math.max(0, ((acc.audioOut - S.prev.aOut) * 8) / dt);
       const dLost = acc.packetsLost - S.prev.lost;
       const dRecv = acc.packetsRecv - S.prev.recv;
       if (dLost + dRecv > 0) lossPct = (dLost / (dLost + dRecv)) * 100;
     }
   }
-  S.prev = { t: now, in: acc.inBytes, out: acc.outBytes, lost: acc.packetsLost, recv: acc.packetsRecv };
+  S.prev = {
+    t: now, in: acc.inBytes, out: acc.outBytes,
+    aIn: acc.audioIn, aOut: acc.audioOut,
+    lost: acc.packetsLost, recv: acc.packetsRecv,
+  };
 
   renderPing(acc.rtt);
   adaptQuality(acc.rtt, lossPct);
   await renderSecurity(acc);
   renderStatsPanel(acc, inBps, outBps, lossPct);
+  renderProbe(audioInBps, audioOutBps);
+  syncStatus();
+  watchdog(lossPct);
+
+  // Состояние собеседника пересылаем регулярно: одно потерянное сообщение
+  // раньше означало чёрный квадрат вместо живого видео.
+  if (++S.tick % 3 === 0) sendState();
+}
+
+/** Что реально происходит со звуком — понятным языком. */
+function renderProbe(inBps, outBps) {
+  if ($('settingsPanel').hidden) return;
+
+  const out = $('probeOut');
+  const good = outBps > 3000;
+  out.textContent = S.micOn ? (good ? Math.round(outBps / 1000) + ' кбит/с' : 'нет сигнала') : 'выключен';
+  out.className = S.micOn && good ? 'is-good' : 'is-bad';
+
+  const inc = $('probeIn');
+  const okIn = inBps > 3000;
+  inc.textContent = okIn ? Math.round(inBps / 1000) + ' кбит/с' : (S.peerPresent ? 'тишина' : 'нет собеседника');
+  inc.className = okIn ? 'is-good' : '';
+
+  const hint = $('probeHint');
+  if (!S.micOn) {
+    hint.textContent = 'Микрофон выключен — включите его кнопкой в панели.';
+    hint.className = 'probe__hint is-bad';
+  } else if (!good && S.peerPresent) {
+    hint.textContent = 'Голос не уходит. Проверьте, тот ли микрофон выбран выше и не заглушён ли он в системе.';
+    hint.className = 'probe__hint is-bad';
+  } else if (S.soundBlocked) {
+    hint.textContent = 'Звук собеседника заблокирован браузером — нажмите кнопку вверху экрана.';
+    hint.className = 'probe__hint is-bad';
+  } else if (okIn) {
+    hint.textContent = 'Звук идёт в обе стороны.';
+    hint.className = 'probe__hint';
+  } else {
+    hint.textContent = 'Скажите что-нибудь: полоска должна двигаться.';
+    hint.className = 'probe__hint';
+  }
+}
+
+/**
+ * Замершая картинка и рассыпающийся канал выглядят одинаково — как «всё
+ * висит». Ловим это и пробуем пересобрать соединение, но не чаще раза в
+ * 20 секунд, чтобы не устроить бесконечный цикл переподключений.
+ */
+function watchdog(loss) {
+  if (!S.pc || S.pc.connectionState !== 'connected') return;
+  const now = performance.now();
+  const frozen = S.remoteState.cam && frames.cam.at > 0 && now - frames.cam.at > 6000;
+  const broken = loss > 25;
+
+  if (frozen || broken) {
+    setStatus('bad', frozen ? 'Видео замерло' : 'Канал перегружен');
+    if (now - S.lastRecover > 20000) reconnect(frozen ? 'Видео замерло, пересобираю связь' : 'Связь плохая, пересобираю');
+  }
 }
 
 function renderPing(rtt) {
@@ -1086,6 +1385,11 @@ bindSwitch('lowLatency', 'lowLatency', (on) => {
 });
 bindSwitch('shareAudio', 'shareAudio');
 bindSwitch('mirrorSelf', 'mirror', refreshUi);
+bindSwitch('noiseSuppress', 'noiseSuppress', () => applyAudioProcessing(true));
+bindSwitch('echoCancel', 'echoCancel', () => applyAudioProcessing(true));
+bindSwitch('autoGain', 'autoGain', () => applyAudioProcessing(true));
+
+$('reconnectBtn').addEventListener('click', () => reconnect());
 
 /* ─────────────── Экраны ─────────────── */
 
@@ -1107,6 +1411,7 @@ async function enterCall(roomId) {
   setStatus('connecting', 'Подключение…');
 
   await ensureMedia();
+  startFrameWatch();
   S.sinkId = prefs.get('sink', '');
   if (S.sinkId) setSink(S.sinkId);
   refreshUi();
@@ -1131,11 +1436,11 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.quality = 0;
   S.main = null;
   S.mainLocked = false;
-  meters.peer?.stop();
-  delete meters.peer;
+  stopFrameWatch();
+  $('soundGate').hidden = true;
   for (const id of ['remote-cam', 'remote-screen', 'local-screen']) tileVideo(id).srcObject = null;
-  $('remoteAudio').srcObject = null;
-  $('remoteScreenAudio').srcObject = null;
+  for (const k of Object.keys(remoteTracks)) remoteTracks[k] = null;
+  onSpeak('peer', false);
   releaseWakeLock();
 
   $('endedTitle').textContent = title;
@@ -1190,6 +1495,7 @@ const KEYS = {
   a: () => { setSpeaker(!S.speakerOn); toast(S.speakerOn ? 'Звук включён' : 'Звук выключен', 1200); },
   s: () => togglePanel('statsPanel', 'statsBtn'),
   k: () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); },
+  r: () => reconnect(),
   e: () => endCall(),
   f: () => {
     const el = tileEl(S.main);
@@ -1198,7 +1504,7 @@ const KEYS = {
   },
 };
 // Раскладка не должна мешать: те же клавиши в кириллице
-const RU = { ь: 'm', м: 'v', в: 'd', ф: 'a', ы: 's', л: 'k', у: 'e', а: 'f' };
+const RU = { ь: 'm', м: 'v', в: 'd', ф: 'a', ы: 's', л: 'k', у: 'e', а: 'f', к: 'r' };
 
 addEventListener('keydown', (e) => {
   if (!S.inCall || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -1247,7 +1553,10 @@ navigator.mediaDevices?.addEventListener?.('devicechange', listDevices);
 // Браузер держит звук на паузе до первого действия пользователя — будим его,
 // иначе индикатор речи и сигналы будут молчать при входе по прямой ссылке.
 for (const ev of ['pointerdown', 'keydown']) {
-  addEventListener(ev, () => { if (audioCtx?.state === 'suspended') audioCtx.resume().catch(() => {}); }, { passive: true });
+  addEventListener(ev, () => {
+    if (audioCtx?.state === 'suspended') audioCtx.resume().catch(() => {});
+    if (S.soundBlocked) playRemoteAudio();
+  }, { passive: true });
 }
 
 function beep(freq) {
