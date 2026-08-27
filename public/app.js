@@ -2358,7 +2358,17 @@ async function hardRestart(notify, reason) {
    */
   const now = performance.now();
   const manual = reason === 'кнопка' || reason === 'собеседник вошёл заново';
-  const quiet = manual ? 0 : notify ? 6000 : 9000;
+
+  /*
+   * Пауза защищает идущее согласование — значит, защищать надо только то,
+   * что ещё живо. Когда соединения нет вовсе или оно уже объявлено
+   * мёртвым, пересборка — единственный путь назад, и придерживать её
+   * нельзя. Именно так однажды и вышло: откат с неработающего
+   * ретранслятора попал в паузу, следом в неё же попала пересборка по
+   * оборванной связи, и звонок остался лежать без единой попытки встать.
+   */
+  const dead = !S.pc || S.pc.connectionState === 'failed' || S.pc.connectionState === 'closed';
+  const quiet = manual || dead ? 0 : notify ? 6000 : 9000;
   if (quiet && S.lastRestart && now - S.lastRestart < quiet) {
     logEvent('plain', `Пересборка (${reason || 'по команде'}) пропущена — только что пересобирались`);
     return;
@@ -3467,8 +3477,37 @@ for (const id of ['turnUrl', 'turnUser', 'turnPass']) {
   $(id).addEventListener('change', (e) => {
     prefs.set(id, e.target.value.trim());
     logEvent('plain', 'Настройки TURN изменены');
+    // Введённые данные — новые, прошлый вердикт к ним отношения не имеет
+    S.relayOk = null;
+    S.relayProbe = null;
   });
 }
+
+/*
+ * Проверка TURN по нажатию. Узнать, работает ли ретранслятор, иначе можно
+ * только в бою — когда связь уже не строится и разбираться некогда.
+ * Здесь же ответ приходит за несколько секунд и словами.
+ */
+$('turnCheck').addEventListener('click', async () => {
+  const note = $('turnResult');
+  const btn = $('turnCheck');
+  if (!hasRelay()) {
+    note.textContent = 'Адрес не задан: впишите его в поле выше — он начинается с turn: или turns:';
+    note.classList.add('is-warn');
+    return;
+  }
+  btn.disabled = true;
+  note.classList.remove('is-warn');
+  note.textContent = 'Проверяю…';
+  S.relayOk = null;
+  S.relayProbe = null;
+  const ok = await relayUsable();
+  btn.disabled = false;
+  note.classList.toggle('is-warn', !ok);
+  note.textContent = ok
+    ? 'Ретранслятор отвечает. Теперь связь построится даже там, где прямой путь не складывается.'
+    : 'Ретранслятор не ответил. Проверьте адрес, логин и пароль; если сервер требует TLS — адрес должен начинаться с turns: и обычно оканчиваться на :443 или :5349.';
+});
 
 /*
  * Отпечаток сборки берём у сервера, а не из константы: так сразу видно,
