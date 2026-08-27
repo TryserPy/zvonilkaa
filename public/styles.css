@@ -459,6 +459,49 @@ button { cursor: pointer; background: none; border: 0; }
 .panel header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .panel h2 { font-size: 13px; font-weight: 540; letter-spacing: -.01em; }
 
+/* Вкладки внутри панели */
+.tabs { display: flex; gap: 4px; }
+.tab {
+  position: relative; padding: 5px 10px; border-radius: 8px;
+  font-size: 12.5px; color: var(--muted);
+  transition: background .16s, color .16s;
+}
+.tab:hover { background: var(--surface-2); }
+.tab.is-on { background: var(--surface-2); color: var(--text); font-weight: 540; }
+.tab__badge {
+  display: inline-block; margin-left: 6px; min-width: 16px; height: 16px;
+  padding: 0 4px; border-radius: 8px; background: var(--danger); color: #fff;
+  font-size: 10px; line-height: 16px; text-align: center;
+}
+
+/* График пинга */
+.spark {
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 9px 11px 4px; margin-bottom: 10px;
+}
+.spark__head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.spark__head b { font-size: 12px; text-transform: none; letter-spacing: 0; color: var(--text); font-variant-numeric: tabular-nums; }
+.spark__chart { width: 100%; height: 46px; margin-top: 4px; overflow: visible; }
+.spark__chart polyline { stroke: var(--accent); stroke-width: 1.6px; stroke-linejoin: round; stroke-linecap: round; }
+.spark__chart polyline.is-bad { stroke: var(--danger); }
+.spark__chart polyline.is-mid { stroke: var(--warn); }
+
+/* Журнал */
+.log {
+  max-height: 44dvh; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: var(--surface-2); padding: 8px 10px;
+  font: 400 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.log__row { display: grid; grid-template-columns: 52px 1fr; gap: 8px; padding: 2px 0; }
+.log__row + .log__row { border-top: 1px solid var(--line); }
+.log__t { color: var(--muted); font-variant-numeric: tabular-nums; }
+.log__row.is-error .log__text { color: var(--danger); }
+.log__row.is-warn .log__text { color: var(--warn); }
+.log__row.is-good .log__text { color: var(--accent); }
+.log__text { overflow-wrap: anywhere; }
+.log__empty { color: var(--muted); }
+
 .stats__grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
 .stat { background: var(--surface); padding: 9px 11px; }
 .stat span { display: block; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
@@ -489,24 +532,6 @@ button { cursor: pointer; background: none; border: 0; }
 }
 .namefield input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
 .namefield input::placeholder { color: var(--muted); }
-
-/* Выбор фона */
-.bg-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.bg {
-  display: grid; place-items: center; gap: 4px; padding: 9px 4px;
-  border-radius: 10px; border: 1px solid var(--line);
-  background: var(--surface-2); color: var(--text);
-  transition: border-color .16s, background .16s, transform .18s var(--spring);
-}
-.bg:active { transform: scale(.95); }
-.bg em { font-style: normal; font-size: 10px; color: var(--muted); }
-.bg svg { width: 20px; height: 20px; }
-.bg__sw { width: 20px; height: 20px; border-radius: 6px; display: block; }
-.bg__g1 { background: linear-gradient(140deg, #f6d365, #fda085); }
-.bg__g2 { background: linear-gradient(140deg, #6ec3f4, #3a7bd5); }
-.bg__g3 { background: linear-gradient(140deg, #35374a, #0f1020); }
-.bg[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface-2)); }
-.bg[aria-pressed="true"] em { color: var(--text); }
 
 /* Проверка звука */
 .probe {
@@ -676,8 +701,6 @@ button { cursor: pointer; background: none; border: 0; }
   .chat__log { max-height: 52dvh; }
   .chat__form input, .chat__send { height: 46px; }
   .chat__send { width: 46px; }
-  .bg-picker { gap: 8px; }
-  .bg { padding: 12px 4px; }
   .field input[type="text"] { height: 46px; }
 
   .field select, .switch i { min-height: 44px; }

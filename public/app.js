@@ -56,9 +56,6 @@ const S = {
   chat: null,        // канал данных
   chatOpen: false,
   unread: 0,
-  bg: 'off',         // off | blur | g1 | g2 | g3 | custom
-  bgNative: false,   // размытие делает сам браузер
-  rawCam: null,      // исходная дорожка камеры до обработки
 
   lowLatency: true,
   latencyBackoff: false,
@@ -77,6 +74,12 @@ const S = {
   speakingSelf: false,
   tick: 0,
   lastRecover: 0,
+  logErrors: 0,
+  restarting: false,
+  serverBuild: '',
+  lastRoute: '',
+  rtts: [],
+  restarts: 0,
 
   makingOffer: false,
   ignoreOffer: false,
@@ -229,6 +232,89 @@ const prefs = {
   },
 };
 
+/* ═══════════════════════════════════════════════════════════════════
+   ЖУРНАЛ
+   ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * Кольцевой буфер событий: состояния соединения, отказы, выбранные сетевые
+ * пути. Нужен, чтобы разбирать жалобы вида «связь пропала» по фактам, а не
+ * по памяти. Наружу ничего не уходит — только по кнопке «Скопировать».
+ */
+const LOG = [];
+const LOG_LIMIT = 400;
+
+function logEvent(kind, text) {
+  const entry = { t: Date.now(), kind, text: String(text).slice(0, 400) };
+  LOG.push(entry);
+  if (LOG.length > LOG_LIMIT) LOG.shift();
+
+  if (kind === 'error') {
+    S.logErrors++;
+    renderLogBadge();
+  }
+  if (!$('logView').hidden) renderLog();
+}
+
+const logTime = (t) => new Date(t).toTimeString().slice(0, 8);
+
+function renderLog() {
+  const list = $('logList');
+  if (!LOG.length) {
+    list.innerHTML = '<p class="log__empty">Пока пусто. Здесь появятся события соединения и ошибки.</p>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const entry of LOG) {
+    const row = document.createElement('div');
+    row.className = 'log__row' + (entry.kind === 'plain' ? '' : ' is-' + entry.kind);
+    const time = document.createElement('span');
+    time.className = 'log__t';
+    time.textContent = logTime(entry.t);
+    const text = document.createElement('span');
+    text.className = 'log__text';
+    text.textContent = entry.text;
+    row.append(time, text);
+    list.append(row);
+  }
+  list.scrollTop = list.scrollHeight;
+}
+
+function renderLogBadge() {
+  const badge = $('logBadge');
+  badge.hidden = S.logErrors === 0 || !$('logView').hidden;
+  badge.textContent = S.logErrors > 9 ? '9+' : String(S.logErrors);
+}
+
+function logReport() {
+  const head = [
+    'Звонилка, отчёт',
+    'Сборка: ' + BUILD + ' · ' + (S.serverBuild || '?'),
+    'Браузер: ' + navigator.userAgent,
+    'Комната: ' + (S.roomId || '—') + (S.key ? ' (с ключом)' : ' (без ключа)'),
+    'Состояние: ' + (S.pc ? S.pc.connectionState + ' / ' + S.pc.iceConnectionState : 'нет соединения'),
+    'Маршрут: ' + (S.lastRoute || '—'),
+    'Пинг: ' + (S.rtts.length ? summarizeRtt() : '—'),
+    '',
+  ].join('\n');
+  return head + LOG.map((e) => logTime(e.t) + '  ' + e.text).join('\n');
+}
+
+$('logCopy').addEventListener('click', async () => {
+  const text = logReport();
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Отчёт скопирован — вставьте его в переписку');
+  } catch {
+    toast('Не удалось скопировать. Выделите текст журнала вручную.', 4000);
+  }
+});
+
+addEventListener('error', (e) => logEvent('error', 'Ошибка: ' + (e.message || e.type)));
+addEventListener('unhandledrejection', (e) =>
+  logEvent('error', 'Необработанный сбой: ' + (e.reason?.message || e.reason))
+);
+
 /* ─────────────── Тема ─────────────── */
 
 (function initTheme() {
@@ -292,6 +378,7 @@ async function ensureMedia() {
       }
       return stream;
     } catch (err) {
+      logEvent(err?.message === 'timeout' ? 'error' : 'warn', 'Устройства: ' + (err?.name || err?.message));
       if (err?.name === 'NotAllowedError') {
         toast('Доступ к камере и микрофону запрещён. Разрешите его в настройках сайта.', 6000);
         return null;
@@ -429,11 +516,6 @@ function fillSelect(select, devices, fallback) {
 async function switchDevice(kind, deviceId) {
   if (!S.camStream) return;
 
-  // Обработку фона на время смены камеры снимаем: она держит старую
-  // дорожку, и без этого в отправку ушёл бы застывший кадр
-  const bgWas = kind === 'video' && S.bg !== 'off' ? S.bg : null;
-  if (bgWas) await applyBackground('off');
-
   try {
     const constraints =
       kind === 'audio'
@@ -461,8 +543,6 @@ async function switchDevice(kind, deviceId) {
     toast(kind === 'audio' ? 'Микрофон переключён' : 'Камера переключена', 1600);
   } catch {
     toast('Не удалось переключить устройство');
-  } finally {
-    if (bgWas) await applyBackground(bgWas);
   }
 }
 
@@ -1024,6 +1104,7 @@ function connectSignaling() {
 
   ws.addEventListener('open', () => {
     S.wsRetry = 0;
+    logEvent('good', 'Сигнальный канал открыт');
     setStatus('connecting', 'Вхожу в комнату…');
     ws.send(JSON.stringify({ type: 'join', roomId: S.roomId }));
   });
@@ -1037,6 +1118,7 @@ function connectSignaling() {
 
   ws.addEventListener('close', () => {
     if (!S.inCall) return;
+    logEvent('warn', 'Сигнальный канал закрылся, переподключаюсь');
     S.wsRetry++;
     setStatus('connecting', 'Переподключение…');
     setTimeout(connectSignaling, Math.min(1000 * 2 ** S.wsRetry, 10000));
@@ -1077,6 +1159,7 @@ async function handleSignal(m) {
       break;
 
     case 'joined':
+      logEvent('good', `Вошли в комнату, собеседников: ${m.peers.length}, роль: ${m.polite ? 'ведомая' : 'ведущая'}`);
       S.peerId = m.peerId;
       S.polite = m.polite;
       if (m.peers.length) { S.peerPresent = true; await startPeerConnection(); refreshUi(); }
@@ -1084,6 +1167,7 @@ async function handleSignal(m) {
       break;
 
     case 'peer-joined':
+      logEvent('good', 'Собеседник вошёл');
       S.peerPresent = true;
       setInvite(false);
       beep(660);
@@ -1094,6 +1178,7 @@ async function handleSignal(m) {
       break;
 
     case 'peer-left':
+      logEvent('warn', 'Собеседник вышел');
       beep(380);
       onPeerLeft();
       break;
@@ -1110,6 +1195,7 @@ async function handleSignal(m) {
 
 function keyMismatch() {
   if (S.keyWarned) return;
+  logEvent('error', 'Ключи комнаты не совпали');
   S.keyWarned = true;
   S.fatal = 'Ссылки не совпадают';
   setStatus('bad', S.fatal);
@@ -1130,6 +1216,12 @@ async function onRemoteSignal(payload) {
   } else if (S.key) {
     // Мы в защищённой комнате, а собеседник прислал открытый текст
     return keyMismatch();
+  }
+
+  if (data.ctl === 'restart') {
+    logEvent('warn', 'Собеседник попросил пересобрать соединение');
+    await hardRestart(false, 'по просьбе собеседника');
+    return;
   }
 
   if (data.state) {
@@ -1230,11 +1322,29 @@ async function bindRoles() {
   preferScreenCodec();
 }
 
+/**
+ * Список серверов ICE. Свой TURN, вбитый в настройках, добавляется к тем,
+ * что прислал сервер: без ретранслятора некоторые пары — например, когда
+ * у одного VPN, а у другого нет — не соединяются вообще никак.
+ */
+function iceConfig() {
+  const list = [...(S.iceServers || [{ urls: ['stun:stun.l.google.com:19302'] }])];
+  const url = prefs.get('turnUrl', '').trim();
+  if (url) {
+    list.push({
+      urls: url.split(',').map((u) => u.trim()).filter(Boolean),
+      username: prefs.get('turnUser', '') || undefined,
+      credential: prefs.get('turnPass', '') || undefined,
+    });
+  }
+  return list;
+}
+
 async function startPeerConnection() {
   if (S.pc) return S.pc;
 
   const pc = new RTCPeerConnection({
-    iceServers: S.iceServers || [{ urls: ['stun:stun.l.google.com:19302'] }],
+    iceServers: iceConfig(),
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 4,
@@ -1297,7 +1407,18 @@ async function startPeerConnection() {
     refreshUi();
   });
 
+  pc.addEventListener('icecandidateerror', (e) => {
+    // 701 — обычное дело при переборе адресов, шумит зря
+    if (e.errorCode && e.errorCode !== 701) {
+      logEvent('warn', `ICE ${e.errorCode}: ${e.errorText || ''} (${e.url || ''})`);
+    }
+  });
+
   pc.addEventListener('iceconnectionstatechange', () => {
+    logEvent(
+      pc.iceConnectionState === 'failed' ? 'error' : 'plain',
+      'ICE: ' + pc.iceConnectionState
+    );
     if (pc.iceConnectionState === 'failed') {
       setStatus('bad', 'Восстановление связи…');
       try { pc.restartIce(); } catch {}
@@ -1307,7 +1428,14 @@ async function startPeerConnection() {
   });
 
   pc.addEventListener('connectionstatechange', () => {
-    switch (pc.connectionState) {
+    const state = pc.connectionState;
+    logEvent(state === 'failed' ? 'error' : state === 'connected' ? 'good' : 'plain', 'Соединение: ' + state);
+
+    // Отвалившееся насмерть соединение чинится только полной пересборкой:
+    // restartIce уже не помогает, если транспорт закрыт
+    if (state === 'failed') scheduleRebuild('Связь оборвалась');
+
+    switch (state) {
       case 'connected':
         syncStatus();
         setInvite(false);
@@ -1378,6 +1506,51 @@ function applyLatency() {
     try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = short ? 0 : null; } catch {}
     try { if ('playoutDelayHint' in r) r.playoutDelayHint = short ? 0 : undefined; } catch {}
   }
+}
+
+/*
+ * Пересборка соединения с нуля. Нужна там, где restartIce уже бессилен:
+ * когда транспорт закрылся, когда телефон уходил в сон, когда сеть
+ * сменилась целиком. Обе стороны делают это одновременно, иначе одна
+ * будет ждать оффер, которого никто не пришлёт.
+ */
+async function hardRestart(notify, reason) {
+  if (S.restarting) return;
+  S.restarting = true;
+  S.restarts++;
+  logEvent('warn', `Пересобираю соединение (${reason || 'по команде'})`);
+
+  if (notify) signal({ ctl: 'restart' });
+
+  try { S.pc?.close(); } catch {}
+  S.pc = null;
+  S.chat = null;
+  S.send = { mic: null, cam: null, screen: null, screenAudio: null };
+  for (const k of Object.keys(remoteTracks)) remoteTracks[k] = null;
+  S.makingOffer = false;
+  S.ignoreOffer = false;
+  S.settingRemoteAnswer = false;
+  S.prev = null;
+  S.lastRoute = '';
+  updateChatAvailability();
+  setStatus('connecting', 'Пересобираю соединение…');
+
+  // Небольшая пауза, чтобы обе стороны успели закрыть старое
+  await new Promise((r) => setTimeout(r, 400));
+  if (S.peerPresent && S.inCall) await startPeerConnection();
+  S.restarting = false;
+  watchStall();
+}
+
+let rebuildTimer = null;
+function scheduleRebuild(reason) {
+  if (rebuildTimer || !S.inCall) return;
+  rebuildTimer = setTimeout(() => {
+    rebuildTimer = null;
+    if (S.inCall && S.peerPresent && S.pc?.connectionState !== 'connected') {
+      hardRestart(true, reason);
+    }
+  }, 2500);
 }
 
 function onPeerLeft() {
@@ -1484,6 +1657,12 @@ async function collectStats() {
         acc.localAddr = local.address || local.ip || null;
         acc.proto = local.protocol || null;
         acc.relayProto = local.relayProtocol || null;
+        const routeText = `${local.candidateType}/${remote.candidateType} ${local.protocol || ''} ${acc.localAddr || ''}`.trim();
+        if (routeText !== S.lastRoute) {
+          if (S.lastRoute) logEvent('warn', 'Сетевой путь сменился: ' + routeText);
+          else logEvent('good', 'Сетевой путь: ' + routeText);
+          S.lastRoute = routeText;
+        }
         acc.route =
           local.candidateType === 'relay' || remote.candidateType === 'relay'
             ? 'через TURN-сервер'
@@ -1649,12 +1828,45 @@ function watchdog(loss) {
   }
 }
 
+function summarizeRtt() {
+  if (!S.rtts.length) return '—';
+  const min = Math.round(Math.min(...S.rtts));
+  const max = Math.round(Math.max(...S.rtts));
+  const avg = Math.round(S.rtts.reduce((a, b) => a + b, 0) / S.rtts.length);
+  return `${min}–${max}, в среднем ${avg} мс`;
+}
+
+/**
+ * Мгновенное число врёт: пинг может прыгать вдвое между секундами, и по
+ * нему не понять, стабильный канал или рваный. График за минуту показывает
+ * именно разброс.
+ */
+function renderSpark() {
+  const line = $('sparkLine');
+  if (S.rtts.length < 2) { line.setAttribute('points', ''); return; }
+
+  const max = Math.max(...S.rtts, 60);
+  const step = 240 / (S.rtts.length - 1);
+  const points = S.rtts
+    .map((v, i) => `${(i * step).toFixed(1)},${(44 - (v / max) * 42).toFixed(1)}`)
+    .join(' ');
+  line.setAttribute('points', points);
+
+  const avg = S.rtts.reduce((a, b) => a + b, 0) / S.rtts.length;
+  line.className.baseVal = avg < 80 ? '' : avg < 200 ? 'is-mid' : 'is-bad';
+  $('sparkSummary').textContent = summarizeRtt();
+}
+
 function renderPing(rtt) {
   const el = $('pingText');
   if (rtt == null) { el.textContent = '— мс'; el.className = ''; return; }
   const ms = Math.round(rtt);
   el.textContent = ms + ' мс';
   el.className = ms < 80 ? 'is-good' : ms < 200 ? 'is-mid' : 'is-bad';
+
+  S.rtts.push(rtt);
+  if (S.rtts.length > 60) S.rtts.shift();
+  if (!$('statsPanel').hidden && !$('qualityView').hidden) renderSpark();
 }
 
 /**
@@ -1695,6 +1907,7 @@ function adaptQuality(rtt, loss) {
     if (++S.voiceOnlySince >= 3) {
       S.voiceOnly = true;
       S.voiceOnlySince = 0;
+      logEvent('warn', 'Потери слишком велики — оставляю только голос');
       S.qualityHold = 0;
       applySendParams();
       toast('Сеть не тянет видео — оставляю только голос', 3200);
@@ -1756,6 +1969,15 @@ function renderStatsPanel(acc, inBps, outBps, loss) {
   const parts = [`Отправка: <b>${LADDER[S.quality].label}</b>, подстраивается автоматически.`];
   if (acc.codec) parts.push(`Кодек: <b>${acc.codec}</b>.`);
   if (S.fingerprint) parts.push(`Код безопасности: <b>${S.fingerprint}</b> — должен совпадать у обоих.`);
+  if (S.rtts.length > 8) {
+    const spread = Math.max(...S.rtts) - Math.min(...S.rtts);
+    if (spread > 90) {
+      parts.push(
+        `<b>Пинг скачет на ${Math.round(spread)} мс</b> — канал рваный. ` +
+          'Так ведут себя мобильный интернет, Wi-Fi на пределе дальности и VPN.'
+      );
+    }
+  }
   if (S.key) parts.push('Сигналинг зашифрован ключом из ссылки — сервер видит только шифротекст.');
   if (S.voiceOnly) parts.push('<b>Сеть не тянет видео</b> — временно оставлен только голос.');
 
@@ -1826,6 +2048,21 @@ function togglePanel(id, btnId) {
     }
   }
 }
+
+function showTab(which) {
+  const quality = which === 'quality';
+  $('qualityView').hidden = !quality;
+  $('logView').hidden = quality;
+  $('tabQuality').classList.toggle('is-on', quality);
+  $('tabLog').classList.toggle('is-on', !quality);
+  $('tabQuality').setAttribute('aria-selected', String(quality));
+  $('tabLog').setAttribute('aria-selected', String(!quality));
+  if (!quality) { S.logErrors = 0; renderLog(); }
+  renderLogBadge();
+}
+
+$('tabQuality').addEventListener('click', () => showTab('quality'));
+$('tabLog').addEventListener('click', () => showTab('log'));
 
 $('statsBtn').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
 $('pingPill').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
@@ -1968,140 +2205,9 @@ $('nameInput').value = S.name;
 $('nameSetting').value = S.name;
 
 /* ═══════════════════════════════════════════════════════════════════
-   ФОН
+   НАСТРОЙКИ
    ═══════════════════════════════════════════════════════════════════ */
 
-const GRADIENTS = {
-  g1: ['#f6d365', '#fda085'],
-  g2: ['#6ec3f4', '#3a7bd5'],
-  g3: ['#3a3d55', '#0f1020'],
-};
-
-const gradientCache = {};
-
-function gradientImage(id) {
-  if (gradientCache[id]) return gradientCache[id];
-  const canvas = document.createElement('canvas');
-  canvas.width = 960;
-  canvas.height = 540;
-  const ctx = canvas.getContext('2d');
-  const [from, to] = GRADIENTS[id];
-  const fill = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-  fill.addColorStop(0, from);
-  fill.addColorStop(1, to);
-  ctx.fillStyle = fill;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  const img = new Image();
-  img.src = canvas.toDataURL('image/jpeg', 0.9);
-  gradientCache[id] = img;
-  return img;
-}
-
-let customImage = null;
-
-function bgNote(text, warn) {
-  const note = $('bgNote');
-  note.textContent = text || '';
-  note.hidden = !text;
-  note.className = warn ? 'field__note is-warn' : 'field__note';
-}
-
-/** Ставит дорожку камеры и в отправку, и в локальные превью. */
-async function useCamTrack(track) {
-  if (!track || !S.camStream) return;
-  track.enabled = S.camOn;
-
-  const old = S.camStream.getVideoTracks()[0];
-  if (old && old !== track) S.camStream.removeTrack(old);
-  if (!S.camStream.getVideoTracks().includes(track)) S.camStream.addTrack(track);
-  S.local.cam = track;
-
-  if (S.send.cam) {
-    try { await S.send.cam.replaceTrack(track); } catch {}
-  }
-  $('previewVideo').srcObject = S.camStream;
-  tileVideo('local-cam').srcObject = S.camStream;
-  refreshUi();
-}
-
-/**
- * Переключает обработку фона. Порядок важен: сначала полностью снимаем
- * предыдущий режим и возвращаем исходную дорожку, потом включаем новый —
- * иначе после пары переключений в отправку уходит мёртвый холст.
- */
-async function applyBackground(mode) {
-  S.bg = mode;
-  prefs.set('bg', mode === 'custom' ? 'off' : mode);
-  for (const button of $('bgPicker').children) {
-    button.setAttribute('aria-pressed', String(button.dataset.bg === mode));
-  }
-
-  const raw = S.rawCam || S.local.cam;
-  if (!raw) return bgNote('Сначала включите камеру', true);
-
-  // Снимаем всё, что было включено раньше
-  if (S.bgNative) {
-    await window.Effects.applyNative(raw, false);
-    S.bgNative = false;
-  }
-  if (window.Effects.active) {
-    window.Effects.stop();
-    await useCamTrack(raw);
-  }
-  S.rawCam = null;
-
-  if (mode === 'off') return bgNote('');
-
-  // Если браузер умеет размывать сам — отдаём работу ему: качество лучше,
-  // а процессор вообще не задействован
-  if (mode === 'blur' && window.Effects.nativeSupported()) {
-    if (await window.Effects.applyNative(raw, true)) {
-      S.bgNative = true;
-      return bgNote('Размытие выполняет сам браузер — без нагрузки на процессор');
-    }
-  }
-
-  if (mode !== 'blur') {
-    const image = mode === 'custom' ? customImage : gradientImage(mode);
-    if (!image) return bgNote('Картинка не выбрана', true);
-    window.Effects.setImage(image);
-  }
-
-  const processed = await window.Effects.start(raw, mode === 'blur' ? 'blur' : 'image');
-  if (!processed) return bgNote('Не удалось включить обработку', true);
-
-  S.rawCam = raw;
-  await useCamTrack(processed);
-  bgNote(
-    mode === 'blur'
-      ? 'Портретный режим: резким остаётся мягкий овал вокруг вас, остальное размыто. Это не вырезание по контуру.'
-      : 'Фон подменяется вокруг мягкого овала. Овал сам держится за того, кто движется в кадре.'
-  );
-}
-
-$('bgPicker').addEventListener('click', (e) => {
-  const button = e.target.closest('.bg');
-  if (!button) return;
-  if (button.dataset.bg === 'custom') return $('bgFile').click();
-  applyBackground(button.dataset.bg);
-});
-
-$('bgFile').addEventListener('change', (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    const img = new Image();
-    img.onload = () => { customImage = img; applyBackground('custom'); };
-    img.onerror = () => bgNote('Не удалось прочитать картинку', true);
-    img.src = reader.result;   // остаётся в браузере, никуда не отправляется
-  };
-  reader.readAsDataURL(file);
-  e.target.value = '';
-});
-
-/* Переключатели в настройках */
 function bindSwitch(id, key, onChange) {
   const el = $(id);
   el.checked = prefs.get(key, el.checked);
@@ -2140,16 +2246,32 @@ $('shareQuality').addEventListener('change', async (e) => {
 });
 
 $('reconnectBtn').addEventListener('click', () => reconnect());
+$('restartBothBtn').addEventListener('click', () => {
+  if (!S.peerPresent) return toast('Собеседника нет — перезапускать нечего');
+  hardRestart(true, 'кнопка');
+  toast('Перезапускаю звонок у обоих', 2500);
+});
+
+for (const id of ['turnUrl', 'turnUser', 'turnPass']) {
+  $(id).value = prefs.get(id, '');
+  $(id).addEventListener('change', (e) => {
+    prefs.set(id, e.target.value.trim());
+    logEvent('plain', 'Настройки TURN изменены');
+  });
+}
+
 /*
  * Отпечаток сборки берём у сервера, а не из константы: так сразу видно,
- * что именно крутится на этом адресе. Локально и на хостинге они должны
- * совпадать — если нет, значит развёрнута другая версия.
+ * что именно крутится на этом адресе.
  */
 $('buildStamp').textContent = 'Сборка ' + BUILD;
 fetch('/api/health', { cache: 'no-store' })
   .then((r) => r.json())
   .then((info) => {
-    if (info?.build) $('buildStamp').textContent = `Сборка ${BUILD} · ${info.build}`;
+    if (info?.build) {
+      S.serverBuild = info.build;
+      $('buildStamp').textContent = `Сборка ${BUILD} · ${info.build}`;
+    }
   })
   .catch(() => {});
 
@@ -2202,9 +2324,6 @@ async function enterCall(roomId, roomKey = null) {
 
   S.sinkId = prefs.get('sink', '');
   if (S.sinkId) setSink(S.sinkId);
-
-  const savedBg = prefs.get('bg', 'off');
-  if (savedBg !== 'off' && S.local.cam) applyBackground(savedBg);
   refreshUi();
 }
 
@@ -2273,6 +2392,9 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.chat = null;
   S.peerName = '';
   clearInterval(stallTimer);
+  clearTimeout(rebuildTimer);
+  rebuildTimer = null;
+  S.rtts = [];
   clearChat();
   updateChatAvailability();
   stopFrameWatch();
@@ -2382,7 +2504,24 @@ function releaseWakeLock() {
   S.wakeLock = null;
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && S.inCall && !S.wakeLock) requestWakeLock();
+  if (document.hidden || !S.inCall) return;
+  if (!S.wakeLock) requestWakeLock();
+
+  // iOS выгружает медиа, когда экран гаснет: вернулись — проверяем, живо ли
+  const state = S.pc?.connectionState;
+  if (S.peerPresent && state && state !== 'connected' && state !== 'connecting') {
+    logEvent('warn', 'Вернулись в приложение, соединение в состоянии ' + state);
+    hardRestart(true, 'возврат из фона');
+  }
+  playRemoteAudio();
+});
+
+// Мобильный Safari умеет возвращать страницу из кэша, минуя обычные события
+addEventListener('pageshow', (e) => {
+  if (e.persisted && S.inCall && S.peerPresent) {
+    logEvent('warn', 'Страница восстановлена из кэша');
+    hardRestart(true, 'восстановление страницы');
+  }
 });
 
 addEventListener('beforeunload', () => {

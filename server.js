@@ -109,7 +109,7 @@ function assetVersion() {
   if (now - versionCache.at < 1000) return versionCache.value;
 
   const hash = crypto.createHash('sha1');
-  for (const name of ['app.js', 'effects.js', 'styles.css']) {
+  for (const name of ['app.js', 'styles.css']) {
     try {
       hash.update(fs.readFileSync(path.join(PUBLIC_DIR, name)));
     } catch {}
@@ -133,7 +133,7 @@ function loadAsset(filePath) {
     raw = Buffer.from(
       raw
         .toString('utf8')
-        .replace(/(["'])\/(app\.js|effects\.js|styles\.css)\1/g, `$1/$2?v=${version}$1`),
+        .replace(/(["'])\/(app\.js|styles\.css)\1/g, `$1/$2?v=${version}$1`),
       'utf8'
     );
   }
