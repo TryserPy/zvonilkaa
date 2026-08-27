@@ -51,7 +51,8 @@ const S = {
   remoteState: { mic: true, cam: false, screen: false },
   remoteKnown: false,
 
-  lowLatency: false,
+  lowLatency: true,
+  latencyBackoff: false,
   shareQuality: 'detail',
   shareAudio: true,
   mirror: true,
@@ -323,8 +324,12 @@ async function listDevices() {
   }
 
   fillSelect($('micSelect'), devices.filter((d) => d.kind === 'audioinput'), 'Микрофон');
-  fillSelect($('camSelect'), devices.filter((d) => d.kind === 'videoinput'), 'Камера');
+  const cams = devices.filter((d) => d.kind === 'videoinput');
+  fillSelect($('camSelect'), cams, 'Камера');
   renderOutputs(devices.filter((d) => d.kind === 'audiooutput'));
+
+  // Кнопка смены камеры нужна, только когда камер и правда несколько
+  $('flipBtn').hidden = cams.length < 2;
 
   // Текущие устройства отмечаем в списках
   const micId = S.local.mic?.getSettings().deviceId;
@@ -438,6 +443,19 @@ async function switchDevice(kind, deviceId) {
 $('micSelect').addEventListener('change', (e) => switchDevice('audio', e.target.value));
 $('camSelect').addEventListener('change', (e) => switchDevice('video', e.target.value));
 $('spkSelect').addEventListener('change', (e) => setSink(e.target.value));
+
+/** Фронтальная или основная — на телефоне это самая нужная кнопка. */
+$('flipBtn').addEventListener('click', async () => {
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+  if (cams.length < 2) return;
+
+  const current = S.local.cam?.getSettings().deviceId;
+  const index = cams.findIndex((d) => d.deviceId === current);
+  const next = cams[(index + 1) % cams.length];
+
+  S.facing = S.facing === 'user' ? 'environment' : 'user';
+  await switchDevice('video', next.deviceId);
+});
 
 async function setSink(deviceId) {
   S.sinkId = deviceId;
@@ -687,9 +705,14 @@ $('prevCamBtn').addEventListener('click', () => setCam(!S.camOn));
 
 $('shareScreenBtn').addEventListener('click', () => (S.sharing ? stopShare() : startShare()));
 
+function hideShareButton(reason) {
+  $('shareScreenBtn').hidden = true;
+  if (reason) toast(reason, 4000);
+}
+
 async function startShare() {
   if (!navigator.mediaDevices?.getDisplayMedia) {
-    return toast('Демонстрация экрана не поддерживается этим браузером');
+    return hideShareButton('Демонстрация экрана недоступна в мобильных браузерах');
   }
 
   const preset = SHARE_PRESETS[S.shareQuality] || SHARE_PRESETS.detail;
@@ -735,8 +758,12 @@ async function startShare() {
         (size.frameRate ? `, ${Math.round(size.frameRate)} к/с` : '') +
         (audio ? ', со звуком' : '')
     );
-  } catch {
-    /* пользователь закрыл выбор окна */
+  } catch (err) {
+    // Отказ пользователя — нормально, а вот «не поддерживается» стоит
+    // показать один раз и убрать кнопку, чтобы не обманывала
+    if (err?.name === 'NotSupportedError' || err?.name === 'TypeError') {
+      hideShareButton('Демонстрация экрана недоступна в мобильных браузерах');
+    }
   }
 }
 
@@ -1287,9 +1314,12 @@ async function applySendParams() {
  */
 function applyLatency() {
   if (!S.pc) return;
+  // На рваной сети маленький буфер вредит больше, чем помогает,
+  // поэтому режим сам отступает и возвращается
+  const short = S.lowLatency && !S.latencyBackoff;
   for (const r of S.pc.getReceivers()) {
-    try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = S.lowLatency ? 0 : null; } catch {}
-    try { if ('playoutDelayHint' in r) r.playoutDelayHint = S.lowLatency ? 0 : undefined; } catch {}
+    try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = short ? 0 : null; } catch {}
+    try { if ('playoutDelayHint' in r) r.playoutDelayHint = short ? 0 : undefined; } catch {}
   }
 }
 
@@ -1339,7 +1369,7 @@ function syncStatus() {
   if (!S.peerPresent) return setStatus('connecting', 'Ждём собеседника');
 
   switch (pc.connectionState) {
-    case 'connected': setStatus('live', 'Соединение установлено'); break;
+    case 'connected': setStatus('live', 'На связи'); break;
     case 'new':
     case 'connecting': setStatus('connecting', 'Подключение…'); break;
     case 'disconnected': setStatus('bad', 'Связь нестабильна'); break;
@@ -1574,6 +1604,13 @@ function renderPing(rtt) {
 function adaptQuality(rtt, loss) {
   if (rtt == null) return;
 
+  // Маленький буфер приёма хорош на ровной сети и вреден на рваной
+  const jittery = loss > 4;
+  if (jittery !== S.latencyBackoff) {
+    S.latencyBackoff = jittery;
+    applyLatency();
+  }
+
   const awful = loss > 12;
   const bad = loss > 4 || rtt > 350;
   const good = loss < 1.5 && rtt < 180;
@@ -1730,7 +1767,7 @@ function bindSwitch(id, key, onChange) {
 
 bindSwitch('lowLatency', 'lowLatency', (on) => {
   applyLatency();
-  toast(on ? 'Режим низкой задержки включён' : 'Обычный режим приёма', 1800);
+  toast(on ? 'Низкая задержка включена' : 'Обычный буфер приёма', 1800);
 });
 bindSwitch('shareAudio', 'shareAudio');
 bindSwitch('mirrorSelf', 'mirror', refreshUi);
@@ -1791,6 +1828,7 @@ async function enterCall(roomId, roomKey = null) {
   $('remoteAvatar').textContent = roomId[0].toUpperCase();
   $('inviteLink').value = location.origin + '/' + roomId + suffix;
   $('shareBtn').hidden = !navigator.share;
+  $('shareScreenBtn').hidden = !navigator.mediaDevices?.getDisplayMedia;
   $('stageEmptyText').textContent = 'Ожидание собеседника…';
   setInvite(false);
 
@@ -1799,11 +1837,23 @@ async function enterCall(roomId, roomKey = null) {
 
   await ensureMedia();
   startFrameWatch();
+  hintOnce();
   S.sinkId = prefs.get('sink', '');
   if (S.sinkId) setSink(S.sinkId);
   refreshUi();
   connectSignaling();
   requestWakeLock();
+}
+
+/** Одна подсказка за всё время: как переключать окна. Дальше молчим. */
+function hintOnce() {
+  if (prefs.get('hintTiles', false)) return;
+  const touch = matchMedia('(pointer: coarse)').matches;
+  setTimeout(() => {
+    if (!S.inCall || !S.peerPresent) return;
+    prefs.set('hintTiles', true);
+    toast(touch ? 'Нажмите на маленькое окно, чтобы развернуть его' : 'Клик по миниатюре разворачивает её на весь экран', 5000);
+  }, 6000);
 }
 
 function endCall(title = 'Звонок завершён', text = 'Спасибо за разговор.') {

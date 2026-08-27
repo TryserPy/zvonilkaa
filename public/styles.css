@@ -102,6 +102,7 @@ button { cursor: pointer; background: none; border: 0; }
 @keyframes pulse { 50% { opacity: .28; } }
 @keyframes ring { 0%, 100% { box-shadow: inset 0 0 0 2px var(--accent); } 50% { box-shadow: inset 0 0 0 4px var(--accent); } }
 @keyframes orbitspin { to { transform: rotate(360deg); } }
+@keyframes sheetUp { from { transform: translateY(100%); } to { transform: none; } }
 @keyframes breathe { 0%, 100% { transform: scale(1); opacity: .55; } 50% { transform: scale(1.35); opacity: 1; } }
 
 .reveal { animation: reveal .6s var(--ease) both; }
@@ -293,6 +294,28 @@ button { cursor: pointer; background: none; border: 0; }
 .ic-badge { width: 13px; height: 13px; color: var(--danger); }
 .tile.is-thumb .ic-badge { width: 11px; height: 11px; }
 
+/* Кнопка на плитке — смена камеры */
+.tile__act {
+  position: absolute; right: 8px; top: 8px; z-index: 2;
+  width: 40px; height: 40px; display: grid; place-items: center;
+  border-radius: 12px; color: #fff;
+  background: rgba(0,0,0,.5); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  transition: transform .2s var(--spring), background .16s;
+}
+.tile__act:active { transform: scale(.9) rotate(-12deg); }
+.tile.is-thumb .tile__act { display: none; }
+
+/* Подсказка, что миниатюру можно развернуть */
+.tile__grow {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  background: rgba(0,0,0,.35); color: #fff;
+  opacity: 0; transition: opacity .25s; pointer-events: none;
+}
+.tile__grow svg { width: 22px; height: 22px; }
+.tile.is-main .tile__grow { display: none; }
+.tile.is-thumb:hover .tile__grow { opacity: 1; }
+.tile.is-thumb:active .tile__grow { opacity: 1; }
+
 /* Говорит */
 .tile.is-speaking { animation: ring 1.6s ease-in-out infinite; }
 .tile.is-thumb.is-speaking { box-shadow: var(--shadow), 0 0 0 2px var(--accent); animation: none; }
@@ -369,6 +392,9 @@ button { cursor: pointer; background: none; border: 0; }
 }
 .soundgate svg { width: 17px; height: 17px; }
 @keyframes nudge { 0%, 100% { transform: none; } 50% { transform: translateY(-3px); } }
+
+/* Ручка шторки — видна только на телефоне */
+.sheet-grip { display: none; }
 
 /* ───────────── Панели ───────────── */
 
@@ -538,15 +564,49 @@ button { cursor: pointer; background: none; border: 0; }
   .tiles { --tw: 27vw; --gap: 8px; --top0: calc(54px + env(safe-area-inset-top)); }
   .tile.is-thumb { left: calc(100% - var(--tw) - 10px); }
 
-  .ctrl { width: 46px; height: 48px; }
-  .ctrl em { display: none; }
-  .ctrl--end { width: 56px; }
+  /* Подписи под иконками остаются: без них панель — ребус */
+  .ctrl { width: 52px; height: 54px; gap: 2px; }
+  .ctrl em { display: block; font-size: 9px; }
+  .ctrl svg { width: 21px; height: 21px; }
+  .ctrl--end { width: 58px; }
   .ctrl--only-wide { display: none; }
-  .dock { border-radius: 16px; gap: 3px; padding: 6px; }
-  .panel { left: 14px; right: 14px; width: auto; bottom: calc(92px + env(safe-area-inset-bottom)); }
-  .panel--settings { left: 14px; right: 14px; }
-  .hud--top { gap: 6px; }
-  .pill { height: 29px; padding: 0 10px; font-size: 11.5px; }
+  .dock { border-radius: 18px; gap: 2px; padding: 6px 7px; }
+
+  .stats.panel { left: 12px; right: 12px; width: auto; bottom: calc(96px + env(safe-area-inset-bottom)); }
+
+  /* Настройки — шторка снизу во всю ширину */
+  .panel--settings {
+    left: 0; right: 0; bottom: 0; width: auto;
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
+    border-left: 0; border-right: 0; border-bottom: 0;
+    max-height: 82dvh;
+    padding: 8px 18px calc(22px + env(safe-area-inset-bottom));
+    animation: sheetUp .34s var(--ease) both;
+  }
+  .panel--settings .sheet-grip {
+    display: block; width: 38px; height: 4px; border-radius: 3px;
+    background: var(--line-strong); margin: 0 auto 10px;
+  }
+  .panel--settings header { position: sticky; top: 0; background: var(--surface); padding-bottom: 8px; z-index: 1; }
+  .panel--settings h2 { font-size: 15px; }
+  .field select, .switch i { min-height: 44px; }
+  .switch i { height: 26px; width: 44px; min-height: 0; }
+  .switch i::after { width: 20px; height: 20px; }
+  .switch input:checked + i::after { transform: translateX(18px); }
+  .switch { grid-template-columns: 44px 1fr; gap: 12px; margin-top: 16px; }
+  .field select { height: 46px; }
+  .keys { display: none; }        /* на телефоне клавиатуры нет */
+
+  .tile__grow { opacity: .85; }   /* на сенсорном экране наведения не бывает */
+  .tile.is-thumb .tile__grow svg { width: 18px; height: 18px; }
+  .hud--top { gap: 6px; flex-wrap: nowrap; }
+  .pill { height: 30px; padding: 0 10px; font-size: 11.5px; }
+  /* Замок оставляем значком: подпись не влезает и гонит панель на вторую строку */
+  .pill--lock span { display: none; }
+  .pill--lock { padding: 0 9px; }
+
+  /* Подпись главного окна не должна нырять под панель управления */
+  .tile.is-main .tile__label { bottom: calc(78px + env(safe-area-inset-bottom)); }
 }
 
 @media (max-height: 460px) and (orientation: landscape) {
