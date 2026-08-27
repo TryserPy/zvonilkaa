@@ -156,6 +156,9 @@ const S = {
   // Замершая картинка: сколько секунд подряд не прибавляются кадры
   frameStall: 0,
   kfAskedAt: 0,
+  wsTimer: null,
+  offerAsked: 0,
+  leaveTimer: null,
 };
 
 /** Как снимать и кодировать экран под разные задачи. */
@@ -1262,32 +1265,88 @@ function initials(name) {
    СИГНАЛИНГ
    ═══════════════════════════════════════════════════════════════════ */
 
+/*
+ * Опознавательный знак вкладки. Живёт, пока живёт вкладка, и переживает
+ * любое переподключение сигналинга. Нужен серверу, чтобы отличить
+ * «вернулся тот же самый» от «пришёл второй участник».
+ */
+const CLIENT_ID = (() => {
+  try {
+    let id = sessionStorage.getItem('zv-client');
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem('zv-client', id);
+    }
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+})();
+
+/*
+ * Сигнальный канал. Ровно один на вкладку — это здесь главное правило.
+ *
+ * Раньше каждое закрытие сокета заводило свой таймер переподключения, а
+ * старый сокет никто не закрывал и не глушил. На рваной сети таймеров
+ * набиралось несколько, и они открывали по сокету каждый. Для сервера это
+ * разные участники: второе подключение того же браузера занимало место в
+ * комнате, роль менялась с ведущей на ведомую, «собеседник» в журнале
+ * оказывался собственной второй вкладкой — а настоящий человек упирался в
+ * «комната занята». Соединение при этом честно пыталось построиться само с
+ * собой и, разумеется, оставалось в состоянии new.
+ *
+ * Поэтому: перед открытием нового сокета старый закрывается явно, все
+ * обработчики сверяются с текущим сокетом и молчат, если они от прошлого,
+ * а таймер переподключения всегда один.
+ */
 function connectSignaling() {
+  clearTimeout(S.wsTimer);
+  S.wsTimer = null;
+
+  const prev = S.ws;
+  if (prev && prev.readyState <= WebSocket.OPEN) {
+    S.ws = null;                       // чтобы его close не завёл ещё один таймер
+    try { prev.close(1000, 'reconnect'); } catch {}
+  }
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
   S.ws = ws;
 
+  /** Этот сокет всё ещё актуален? */
+  const mine = () => S.ws === ws;
+
+  const retry = (why) => {
+    if (!mine() || !S.inCall) return;
+    S.ws = null;
+    logEvent('warn', why);
+    S.wsRetry++;
+    setStatus('connecting', 'Переподключение…');
+    // Разброс в задержке нужен, чтобы две стороны не ломились на сервер
+    // в одну и ту же миллисекунду после общего обрыва.
+    const wait = Math.min(800 * 2 ** S.wsRetry, 8000) + Math.random() * 400;
+    clearTimeout(S.wsTimer);
+    S.wsTimer = setTimeout(connectSignaling, wait);
+  };
+
   ws.addEventListener('open', () => {
+    if (!mine()) { try { ws.close(); } catch {} return; }
     S.wsRetry = 0;
     logEvent('good', 'Сигнальный канал открыт');
     setStatus('connecting', 'Вхожу в комнату…');
-    ws.send(JSON.stringify({ type: 'join', roomId: S.roomId }));
+    ws.send(JSON.stringify({ type: 'join', roomId: S.roomId, clientId: CLIENT_ID }));
   });
 
   let recvChain = Promise.resolve();
   ws.addEventListener('message', (e) => {
+    if (!mine()) return;
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     recvChain = recvChain.then(() => handleSignal(m)).catch((err) => console.warn('signal:', err));
   });
 
-  ws.addEventListener('close', () => {
-    if (!S.inCall) return;
-    logEvent('warn', 'Сигнальный канал закрылся, переподключаюсь');
-    S.wsRetry++;
-    setStatus('connecting', 'Переподключение…');
-    setTimeout(connectSignaling, Math.min(1000 * 2 ** S.wsRetry, 10000));
-  });
+  ws.addEventListener('close', () => retry('Сигнальный канал закрылся, переподключаюсь'));
+  ws.addEventListener('error', () => { if (mine()) try { ws.close(); } catch {} });
 }
 
 // Шифрование асинхронное, поэтому сообщения выстраиваем в очередь:
@@ -1333,7 +1392,21 @@ async function handleSignal(m) {
       else { setStatus('connecting', 'Ждём собеседника'); setInvite(true); }
       break;
 
-    case 'peer-joined':
+    case 'peer-joined': {
+      // Вернулся ли он после моргнувшего сигналинга — или пришёл заново
+      const returning = !!S.leaveTimer;
+      clearTimeout(S.leaveTimer);
+      S.leaveTimer = null;
+
+      if (returning && S.pc?.connectionState === 'connected') {
+        logEvent('good', 'Собеседник вернулся, связь не рвалась');
+        S.peerPresent = true;
+        setInvite(false);
+        sendState();
+        refreshUi();
+        break;
+      }
+
       logEvent('good', 'Собеседник вошёл');
       S.peerPresent = true;
       setInvite(false);
@@ -1343,8 +1416,25 @@ async function handleSignal(m) {
       sendState();
       refreshUi();
       break;
+    }
 
     case 'peer-left':
+      // Сообщение об уходе приходит и тогда, когда у собеседника всего лишь
+      // моргнул сигнальный канал. Сами разговор при этом идёт: медиапоток
+      // живёт своей жизнью и сигналинга не спрашивает. Рвать целое
+      // соединение из-за секундного разрыва служебного канала — значит
+      // устраивать обрыв там, где его не было.
+      if (S.pc?.connectionState === 'connected') {
+        logEvent('warn', 'Собеседник отключился от сигналинга — связь жива, жду');
+        clearTimeout(S.leaveTimer);
+        S.leaveTimer = setTimeout(() => {
+          S.leaveTimer = null;
+          logEvent('warn', 'Собеседник не вернулся');
+          beep(380);
+          onPeerLeft();
+        }, 8000);
+        break;
+      }
       logEvent('warn', 'Собеседник вышел');
       beep(380);
       onPeerLeft();
@@ -1383,6 +1473,15 @@ async function onRemoteSignal(payload) {
   } else if (S.key) {
     // Мы в защищённой комнате, а собеседник прислал открытый текст
     return keyMismatch();
+  }
+
+  // Собеседник ждёт предложения, а мы его не отправили. Так бывает после
+  // пересборки, когда обе стороны оказались «ведомыми» и вежливо ждут
+  // друг друга: соединение при этом навсегда остаётся в состоянии new.
+  if (data.ctl === 'needOffer') {
+    logEvent('warn', 'Собеседник ждёт предложения — отправляю');
+    await sendOffer('по просьбе собеседника');
+    return;
   }
 
   if (data.ctl === 'restart') {
@@ -1637,7 +1736,9 @@ async function startPeerConnection() {
   S.connectDeadline = performance.now() + 9000;
   S.iceTries = 0;
   S.badSince = 0;
+  S.offerAsked = 0;
   watchHandshake();
+  watchNegotiation();
 
   // Слушатель вешаем до создания дорожек: событие о необходимости
   // переговоров прилетает почти сразу и не должно уйти в пустоту.
@@ -1772,6 +1873,7 @@ async function startPeerConnection() {
     switch (state) {
       case 'connected':
         clearTimeout(S.handshakeTimer);
+        clearTimeout(S.negWatch);
         clearTimeout(S.netWatch);
         S.iceTries = 0;
         S.disconnectedAt = 0;
@@ -1910,6 +2012,66 @@ function applyLatency(force) {
  * участников за «строгим» NAT, либо VPN не пропускает UDP. Тогда
  * пересобираем соединение через ретранслятор, если он настроен.
  */
+/** Отправить предложение вручную, минуя negotiationneeded. */
+async function sendOffer(why) {
+  const pc = S.pc;
+  if (!pc || pc.signalingState !== 'stable') return false;
+  try {
+    S.makingOffer = true;
+    const offer = await pc.createOffer();
+    offer.sdp = tuneSdp(offer.sdp);
+    await setLocalSafe(offer);
+    signal({ description: pc.localDescription });
+    logEvent('plain', 'Отправлено предложение (' + (why || 'вручную') + ')');
+    return true;
+  } catch (err) {
+    logEvent('error', 'Не вышло отправить предложение: ' + (err?.message || err));
+    return false;
+  } finally {
+    S.makingOffer = false;
+  }
+}
+
+/*
+ * Сторож немого согласования.
+ *
+ * Соединение, застрявшее в состоянии new при живом собеседнике, — это не
+ * плохая сеть, а несостоявшийся обмен предложениями: никто не начал.
+ * Так получается, если обе стороны считают себя ведомыми — например,
+ * после пересборки, пришедшей вслед за переподключением сигналинга.
+ * Ждать тут нечего: ICE даже не начинал работать, и таймауты рукопожатия
+ * не сработают никогда.
+ *
+ * Ведущая сторона просто отправляет предложение сама. Ведомая просит об
+ * этом собеседника — и если через пять секунд ответа нет, предлагает
+ * сама: лучше коллизия предложений, которую разрулит perfect negotiation,
+ * чем вечная тишина.
+ */
+function watchNegotiation() {
+  clearTimeout(S.negWatch);
+  S.negWatch = setTimeout(async () => {
+    const pc = S.pc;
+    if (!pc || !S.inCall || !S.peerPresent) return;
+    if (pc.connectionState !== 'new' || pc.signalingState !== 'stable') return;
+
+    const now = performance.now();
+    if (!S.polite) {
+      await sendOffer('никто не начал согласование');
+    } else if (!S.offerAsked || now - S.offerAsked > 5000) {
+      S.offerAsked = now;
+      logEvent('warn', 'Согласование не началось — прошу собеседника предложить');
+      signal({ ctl: 'needOffer' });
+      // Второй заход: если и он промолчал, начинаем сами
+      setTimeout(() => {
+        if (S.pc === pc && pc.connectionState === 'new' && pc.signalingState === 'stable') {
+          sendOffer('собеседник не ответил');
+        }
+      }, 5000);
+    }
+    watchNegotiation();
+  }, 4000);
+}
+
 function watchHandshake() {
   clearTimeout(S.handshakeTimer);
   S.handshakeTimer = setTimeout(async () => {
@@ -2003,6 +2165,7 @@ async function hardRestart(notify, reason) {
   S.codecTuned = false;
   S.bufferMs = undefined;
   clearTimeout(S.handshakeTimer);
+  clearTimeout(S.negWatch);
   clearTimeout(S.netWatch);
   updateChatAvailability();
   setStatus('connecting', 'Пересобираю соединение…');
@@ -2026,6 +2189,8 @@ function scheduleRebuild(reason) {
 }
 
 function onPeerLeft() {
+  clearTimeout(S.leaveTimer);
+  S.leaveTimer = null;
   S.peerPresent = false;
   S.remoteState = { mic: true, cam: false, screen: false };
   S.remoteKnown = false;
@@ -3399,7 +3564,7 @@ window.__zv = S;
 window.__zvDebug = {
   adaptQuality, applySendParams, reconnect, diagnose, tuneSdp,
   preferCamCodec, preferAudioCodec, camCodecOrder, hasRelay, targetBuffer,
-  logReport, recoverStep, setRelayOnly, pacePolling,
+  logReport, recoverStep, setRelayOnly, pacePolling, sendOffer, watchNegotiation,
   videoBudget, rungForBudget, watchFrames, forceKeyframe,
   LADDER, SHARE_PRESETS, PLATFORM,
   log: () => LOG.slice(),

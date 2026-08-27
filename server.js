@@ -453,6 +453,24 @@ wss.on('connection', (ws, req) => {
         leaveRoom(ws);
 
         const room = rooms.get(msg.roomId) || new Map();
+
+        // Вкладка представляется своим постоянным знаком. Если она уже
+        // числится в комнате — это не второй участник, а тот же самый,
+        // вернувшийся после обрыва: его прежний сокет ещё не успел
+        // отвалиться. Старый выселяем молча, иначе он занимает место
+        // настоящего собеседника, и комната оказывается «занята» для того,
+        // ради кого её и создавали.
+        if (typeof msg.clientId === 'string' && msg.clientId.length <= 64) {
+          ws.clientId = msg.clientId;
+          for (const [id, peer] of [...room]) {
+            if (peer !== ws && peer.clientId === ws.clientId) {
+              room.delete(id);
+              peer.roomId = null;      // чтобы его выход не объявили собеседнику
+              try { peer.close(); } catch {}
+            }
+          }
+        }
+
         if (room.size >= MAX_PEERS_PER_ROOM) {
           return send(ws, 'room-full', { roomId: msg.roomId });
         }
