@@ -17,6 +17,32 @@ const BUILD = '2026-08-27';
  */
 const ROLES = ['mic', 'cam', 'screen', 'screenAudio'];
 
+/**
+ * Кто мы и на чём. Влияет на выбор кодека: у телефонов аппаратный H.264,
+ * и картинка через него не рассыпается при нагреве, а на настольных
+ * машинах выгоднее VP9 — та же чёткость при меньшем битрейте.
+ */
+const PLATFORM = (() => {
+  const ua = navigator.userAgent || '';
+  const iPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+  const ios = /iPad|iPhone|iPod/.test(ua) || iPadOS;
+  const android = /Android/.test(ua);
+  const safari = /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR/.test(ua);
+  return {
+    ios, android, safari,
+    mobile: ios || android,
+    name: ios ? 'iOS' : android ? 'Android' : /Windows/.test(ua) ? 'Windows'
+        : /Mac OS X/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : 'ПК',
+  };
+})();
+
+/** Порядок кодеков камеры. Решает связка платформ, а не одна наша. */
+function camCodecOrder(peerMobile) {
+  return PLATFORM.mobile || peerMobile
+    ? ['H264', 'VP8', 'VP9', 'AV1']   // аппаратный декодер телефона
+    : ['VP9', 'VP8', 'H264', 'AV1'];  // качество на том же битрейте
+}
+
 /** Порядок плиток в ленте миниатюр. */
 const TILE_ORDER = ['remote-screen', 'remote-cam', 'local-screen', 'local-cam'];
 
@@ -79,7 +105,33 @@ const S = {
   serverBuild: '',
   lastRoute: '',
   rtts: [],
+  rttWin: [],        // окно для медианы — показания не должны прыгать
+  rttEma: null,
+  rttVar: 0,         // средний разброс пинга — он и есть «стабильность»
+  lossEma: 0,
+  jitterMs: 0,
   restarts: 0,
+
+  dcRtt: null,       // задержка, померенная своим пингом по каналу данных
+  dcSentAt: 0,
+  keepTimer: null,
+  keepMisses: 0,
+  disconnectedAt: 0,
+  relayTried: false,
+  statsSlow: false,
+  shakySince: 0,
+
+  peerPlatform: '',
+  peerMobile: false,
+  codecTuned: false,
+  forceRelay: false,
+  iceTries: 0,
+  connectDeadline: 0,
+  badSince: 0,
+  netWatch: null,
+  handshakeTimer: null,
+  rottenSince: 0,
+  bufferMs: undefined,
 
   makingOffer: false,
   ignoreOffer: false,
@@ -89,11 +141,21 @@ const S = {
   prev: null,
   quality: 2,
   qualityHold: 0,
+  qualityAt: 0,
   voiceOnly: false,
   voiceOnlySince: 0,
   wakeLock: null,
   fingerprint: null,
   inCall: false,
+  // Оценка канала: сколько браузер реально готов отдать в сеть
+  bwe: null,
+  bweAt: 0,
+  bweSeen: 0,
+  outBps: 0,
+  videoInBps: 0,
+  // Замершая картинка: сколько секунд подряд не прибавляются кадры
+  frameStall: 0,
+  kfAskedAt: 0,
 };
 
 /** Как снимать и кодировать экран под разные задачи. */
@@ -115,6 +177,40 @@ const SHARE_PRESETS = {
     codecs: ['VP9', 'VP8'],
   },
 };
+
+/**
+ * Потолок для картинки, посчитанный от измеренного канала.
+ *
+ * Браузер всё время меряет пропускную способность сам (transport-cc), и
+ * величина эта лежит в availableOutgoingBitrate. Соблазн велик — взять её
+ * и ограничить ею кодер. Так делать нельзя: вверх канал прощупывается
+ * ровно до заданного потолка, и потолок «сколько есть прямо сейчас»
+ * запирает звонок на этом значении навсегда. Поэтому потолок ставим с
+ * запасом НАД оценкой: перегрузить канал он всё равно не даст — за этим
+ * следит собственный регулятор браузера, который никогда не отдаёт
+ * больше, чем канал вывозит.
+ *
+ * А вот выбирать по этой величине ступень качества — разрешение и
+ * частоту кадров — можно и нужно. Раньше ступень выбиралась постфактум,
+ * по потерям и пингу, то есть уже после того, как канал захлебнулся.
+ * Теперь мы знаем ширину канала заранее и просим у кодера ровно то, что
+ * в него влезает. Именно переполненная очередь в роутере и даёт «пинг
+ * скачет от 100 до 250» и обрывы на VPN.
+ *
+ * Safari и Firefox эту величину не заполняют — там возвращаем null и
+ * работаем по старой схеме, от потерь.
+ */
+const BWE_STALE_MS = 4000;
+function videoBudget() {
+  if (S.bwe == null || performance.now() - S.bweAt > BWE_STALE_MS) return null;
+  return Math.max(300_000, S.bwe * 1.25);
+}
+
+/** Самая высокая ступень лестницы, которая помещается в такой канал. */
+function rungForBudget(bits) {
+  for (let i = 0; i < LADDER.length; i++) if (LADDER[i].bitrate <= bits) return i;
+  return LADDER.length - 1;
+}
 
 const LADDER = [
   { bitrate: 4_000_000, fps: 30, label: 'максимальное' },
@@ -295,6 +391,10 @@ function logReport() {
     'Состояние: ' + (S.pc ? S.pc.connectionState + ' / ' + S.pc.iceConnectionState : 'нет соединения'),
     'Маршрут: ' + (S.lastRoute || '—'),
     'Пинг: ' + (S.rtts.length ? summarizeRtt() : '—'),
+    'Разброс пинга: ' + (S.rttEma == null ? '—' : '±' + Math.round(S.rttVar) + ' мс'),
+    'Потери: ' + (S.lossEma || 0).toFixed(1) + ' %',
+    'Ретранслятор: ' + (S.forceRelay ? 'принудительно' : hasRelay() ? 'доступен' : 'нет'),
+    'Пересборок: ' + S.restarts,
     '',
   ].join('\n');
   return head + LOG.map((e) => logTime(e.t) + '  ' + e.text).join('\n');
@@ -342,12 +442,27 @@ const audioConstraints = () => ({
   channelCount: 1,
 });
 
-const videoConstraints = (facing) => ({
-  width: { ideal: 1280 },
-  height: { ideal: 720 },
-  frameRate: { ideal: 30, max: 30 },
-  facingMode: { ideal: facing },
-});
+/*
+ * Телефон и компьютер снимают по-разному нарочно. 1080p на iPhone или
+ * Android — это лишний нагрев, троттлинг через десять минут и севшая
+ * батарея, а разница на собеседниковом экране почти не видна: мобильная
+ * камера всё равно отдаёт мягкую картинку. На настольной машине запас
+ * есть, и там честные 1080p заметно чище.
+ */
+const videoConstraints = (facing) =>
+  PLATFORM.mobile
+    ? {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30, max: 30 },
+        facingMode: { ideal: facing },
+      }
+    : {
+        width: { ideal: 1920, max: 1920 },
+        height: { ideal: 1080, max: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+        facingMode: { ideal: facing },
+      };
 
 async function ensureMedia() {
   if (S.camStream) return S.camStream;
@@ -981,16 +1096,66 @@ function stopFrameWatch() {
 }
 
 /** Пересобрать соединение, если картинка замерла или связь развалилась. */
+/**
+ * Мягкое лечение: просим браузер заново перебрать сетевые пути. Если это
+ * не помогло дважды подряд, дальше повторять бессмысленно — собираем
+ * соединение с нуля у обоих.
+ */
 function reconnect(reason) {
   if (!S.pc) return toast('Соединения нет — ждём собеседника');
   S.lastRecover = performance.now();
+
+  if (++S.iceTries > 2) {
+    S.iceTries = 0;
+    hardRestart(true, reason || 'переподключение не помогло');
+    return;
+  }
+
   try {
     S.pc.restartIce();
     setStatus('connecting', 'Переподключение…');
     toast(reason || 'Переподключаю связь', 2000);
+    S.connectDeadline = performance.now() + 9000;
+    watchHandshake();
   } catch {
     toast('Не удалось переподключиться');
   }
+}
+
+/**
+ * Лестница восстановления. Раньше на любую беду отвечали одним и тем же
+ * ICE-рестартом, а когда он не помогал — ждали, пока браузер сам решит,
+ * что всё плохо. Теперь шаги идут по возрастанию цены.
+ *
+ *   1. Перебрать пути заново — секунда, разговор даже не прерывается.
+ *   2. Уйти на ретранслятор принудительно. Дороже по задержке, зато
+ *      работает там, где прямой путь не строится в принципе: у одного
+ *      VPN, у другого мобильный интернет с симметричным NAT.
+ *   3. Собрать соединение с нуля у обоих. Несколько секунд тишины,
+ *      но вытаскивает даже наглухо развалившийся транспорт.
+ *
+ * Между шагами держим паузу: сеть должна успеть показать результат
+ * предыдущего, иначе лестница проскакивается за две секунды впустую.
+ */
+function recoverStep(reason) {
+  if (!S.inCall || !S.pc || S.restarting) return;
+  const now = performance.now();
+  // Та же оговорка про ноль: обрыв на пятой секунде звонка обязан
+  // лечиться, а не ждать, пока истекут двенадцать от начала времён.
+  if (S.lastRecover && now - S.lastRecover < 12000) return;
+  S.lastRecover = now;
+
+  if (!S.relayTried && S.iceTries >= 1 && hasRelay() && !S.forceRelay) {
+    S.relayTried = true;
+    setRelayOnly(true, false);
+    S.iceTries = 0;
+    logEvent('warn', `${reason}: перевожу связь на ретранслятор`);
+    toast('Прямой путь не держится — иду через ретранслятор', 3200);
+    hardRestart(true, 'переход на ретранслятор');
+    return;
+  }
+
+  reconnect(reason);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1148,6 +1313,8 @@ function sendState() {
       screen: S.sharing,
       speaking: !!S.speakingSelf && S.micOn,
       name: S.name || '',
+      plat: PLATFORM.name,
+      mobile: PLATFORM.mobile,
     },
   });
 }
@@ -1229,6 +1396,21 @@ async function onRemoteSignal(payload) {
     S.remoteKnown = true;
     S.peerName = String(data.state.name || '').slice(0, 24);
     onSpeak('peer', !!data.state.speaking);
+
+    // Узнали, с чего смотрит собеседник — подбираем кодек под пару.
+    // Один раз за звонок: смена кодека стоит круга переговоров.
+    if (data.state.plat && data.state.plat !== S.peerPlatform) {
+      S.peerPlatform = String(data.state.plat).slice(0, 16);
+      S.peerMobile = !!data.state.mobile;
+      logEvent('plain', 'Собеседник на ' + S.peerPlatform);
+      if (!S.codecTuned && !S.polite && S.pc) {
+        S.codecTuned = true;
+        const order = camCodecOrder(S.peerMobile);
+        preferCamCodec();
+        logEvent('plain', 'Кодек видео: ' + order[0]);
+      }
+    }
+
     refreshUi();
     return;
   }
@@ -1269,23 +1451,100 @@ async function onRemoteSignal(payload) {
    PEER CONNECTION
    ═══════════════════════════════════════════════════════════════════ */
 
-/** Мягкая правка SDP: включаем FEC и DTX у Opus — ровнее звук, меньше трафика. */
+/**
+ * Правка SDP — то немногое, что решает судьбу звука на рваной сети.
+ *
+ * useinbandfec  — Opus подмешивает в каждый пакет упрощённую копию
+ *                 предыдущего, и одиночная потеря просто не слышна.
+ * usedtx=0      — передача не замолкает в паузах. DTX экономит трафик,
+ *                 но съедает первый слог после тишины; на голосовом
+ *                 звонке это заметнее, чем лишние килобиты.
+ * maxaveragebitrate — потолок 64 кбит/с: полноценный звук, а не
+ *                 телефонное качество. Реальный поток всё равно
+ *                 подстраивается под сеть отдельным ограничением.
+ * ptime=20      — кадры по 20 мс: меньше — лишние заголовки,
+ *                 больше — заметная задержка.
+ */
 function tuneSdp(sdp) {
   try {
-    const pt = sdp.match(/a=rtpmap:(\d+)\s+opus\/48000/i)?.[1];
-    if (!pt) return sdp;
-    return sdp.replace(new RegExp(`a=fmtp:${pt} (.*)`), (line, params) => {
-      const set = new Map(
-        params.split(';').filter(Boolean).map((p) => {
-          const [k, v] = p.split('=');
-          return [k.trim(), v];
-        })
-      );
-      set.set('useinbandfec', '1');
-      set.set('usedtx', '1');
-      return `a=fmtp:${pt} ` + [...set].map(([k, v]) => (v === undefined ? k : `${k}=${v}`)).join(';');
-    });
+    let out = sdp;
+    const pt = out.match(/a=rtpmap:(\d+)\s+opus\/48000/i)?.[1];
+    if (pt) {
+      const wanted = {
+        useinbandfec: '1',
+        usedtx: '0',
+        stereo: '0',
+        maxaveragebitrate: '64000',
+        maxplaybackrate: '48000',
+        minptime: '10',
+      };
+      const line = new RegExp(`a=fmtp:${pt} (.*)`);
+      if (line.test(out)) {
+        out = out.replace(line, (_, params) => {
+          const set = new Map(
+            params.split(';').filter(Boolean).map((piece) => {
+              const [k, v] = piece.split('=');
+              return [k.trim(), v];
+            })
+          );
+          for (const [k, v] of Object.entries(wanted)) set.set(k, v);
+          return `a=fmtp:${pt} ` + [...set].map(([k, v]) => (v === undefined ? k : `${k}=${v}`)).join(';');
+        });
+      } else {
+        const map = new RegExp(`(a=rtpmap:${pt}\\s+opus/48000[^\\r\\n]*)`);
+        out = out.replace(map, `$1\r\na=fmtp:${pt} ` +
+          Object.entries(wanted).map(([k, v]) => `${k}=${v}`).join(';'));
+      }
+      if (!new RegExp(`a=ptime:`).test(out)) {
+        out = out.replace(new RegExp(`(a=rtpmap:${pt}\\s+opus/48000[^\\r\\n]*)`), '$1\r\na=ptime:20');
+      }
+    }
+    return out;
   } catch { return sdp; }
+}
+
+/**
+ * Порядок кодеков звука. Если браузер умеет RED (audio/red), ставим его
+ * первым: он шлёт каждый кадр дважды с разным запаздыванием, и голос
+ * переживает даже пачку подряд потерянных пакетов. Стоит это пару
+ * десятков килобит — на фоне видео цена незаметная.
+ */
+function preferAudioCodec() {
+  const t = S.pc?.getTransceivers?.()[0];
+  if (!t || typeof t.setCodecPreferences !== 'function') return;
+  try {
+    const supported = RTCRtpSender.getCapabilities?.('audio')?.codecs;
+    if (!supported || !supported.length) return;
+    const rank = (c) => {
+      const name = c.mimeType.split('/')[1].toLowerCase();
+      if (name === 'red') return 0;
+      if (name === 'opus') return 1;
+      return 2;
+    };
+    const ordered = [...supported].sort((a, b) => rank(a) - rank(b));
+    if (rank(ordered[0]) === 0) t.setCodecPreferences(ordered);
+  } catch {}
+}
+
+/**
+ * Кодек камеры выбираем под пару платформ, а не под свою. iPhone и
+ * Android декодируют H.264 железом: меньше нагрев, меньше пропущенных
+ * кадров, дольше держит батарея. Между настольными машинами выгоднее
+ * VP9 — та же картинка при меньшем потоке.
+ */
+function preferCamCodec() {
+  const t = S.pc?.getTransceivers?.()[1];
+  if (!t || typeof t.setCodecPreferences !== 'function') return;
+  try {
+    const supported = RTCRtpSender.getCapabilities?.('video')?.codecs;
+    if (!supported || !supported.length) return;
+    const wanted = camCodecOrder(S.peerMobile);
+    const rank = (c) => {
+      const i = wanted.indexOf(c.mimeType.split('/')[1].toUpperCase());
+      return i === -1 ? wanted.length : i;
+    };
+    t.setCodecPreferences([...supported].sort((a, b) => rank(a) - rank(b)));
+  } catch {}
 }
 
 async function setLocalSafe(desc) {
@@ -1320,6 +1579,7 @@ async function bindRoles() {
     }
   }
   preferScreenCodec();
+  preferAudioCodec();
 }
 
 /**
@@ -1340,6 +1600,25 @@ function iceConfig() {
   return list;
 }
 
+/**
+ * Переключить режим ретранслятора. Автоматическое включение отражаем в
+ * настройках, но не запоминаем: следующий звонок снова начнёт с попытки
+ * прямого пути — он быстрее, и в другой сети может отлично работать.
+ */
+function setRelayOnly(on, remember) {
+  S.forceRelay = on;
+  const box = $('relayOnly');
+  if (box) box.checked = on;
+  if (remember) prefs.set('forceRelay', on);
+}
+
+/** Есть ли куда отступать, если прямой путь не строится. */
+function hasRelay() {
+  return iceConfig().some((srv) =>
+    [].concat(srv.urls || []).some((u) => /^turns?:/i.test(u))
+  );
+}
+
 async function startPeerConnection() {
   if (S.pc) return S.pc;
 
@@ -1347,9 +1626,18 @@ async function startPeerConnection() {
     iceServers: iceConfig(),
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
-    iceCandidatePoolSize: 4,
+    // Кандидатов собираем заранее — первый оффер уходит уже с адресами,
+    // и рукопожатие не ждёт лишний круг
+    iceCandidatePoolSize: 6,
+    // Аварийный режим: прямой путь не построился, идём только через
+    // ретранслятор. Дороже по задержке, зато соединяется всегда
+    iceTransportPolicy: S.forceRelay ? 'relay' : 'all',
   });
   S.pc = pc;
+  S.connectDeadline = performance.now() + 9000;
+  S.iceTries = 0;
+  S.badSince = 0;
+  watchHandshake();
 
   // Слушатель вешаем до создания дорожек: событие о необходимости
   // переговоров прилетает почти сразу и не должно уйти в пустоту.
@@ -1386,7 +1674,14 @@ async function startPeerConnection() {
       })
     );
     ROLES.forEach((role, i) => (S.send[role] = transceivers[i].sender));
+
+    // Порядок кодеков задаём синхронно, до первого await: событие о
+    // переговорах уже стоит в очереди, и любая пауза здесь означает, что
+    // оффер уйдёт со старым порядком.
     preferScreenCodec();
+    preferAudioCodec();
+    preferCamCodec();
+
     await bindRoles();
   }
 
@@ -1401,9 +1696,32 @@ async function startPeerConnection() {
 
     remoteTracks[role] = e.track;
     S.remote[role] = e.track;
+
+    // Браузер помечает дорожку «mute», когда по ней перестали приходить
+    // пакеты. Для человека это выглядит как замерший экран или пропавший
+    // голос, и раньше мы узнавали об этом только через сторожа кадров —
+    // то есть с задержкой в несколько секунд. Теперь узнаём сразу.
+    e.track.addEventListener('mute', () => {
+      if (!S.inCall) return;
+      logEvent('warn', `Поток «${role}» замолчал`);
+      if (role === 'mic') setStatus('bad', 'Звук пропал');
+      clearTimeout(S.muteTimer);
+      S.muteTimer = setTimeout(() => {
+        if (remoteTracks[role]?.muted && S.pc?.connectionState === 'connected') {
+          recoverStep(`поток «${role}» не вернулся`);
+        }
+      }, 5000);
+    });
+    e.track.addEventListener('unmute', () => {
+      clearTimeout(S.muteTimer);
+      logEvent('good', `Поток «${role}» вернулся`);
+      syncStatus();
+      refreshUi();
+    });
+
     attachRemote();
     playRemoteAudio();
-    applyLatency();
+    applyLatency(true);
     refreshUi();
   });
 
@@ -1435,12 +1753,32 @@ async function startPeerConnection() {
     // restartIce уже не помогает, если транспорт закрыт
     if (state === 'failed') scheduleRebuild('Связь оборвалась');
 
+    // «disconnected» — это ещё не обрыв, но уже тишина в канале. Браузер
+    // сам объявит failed через полминуты и больше; ждать так долго нельзя,
+    // человек за это время успевает решить, что связь умерла. Даём сети
+    // четыре секунды на самоизлечение и беремся за неё сами.
+    if (state === 'disconnected') {
+      S.disconnectedAt = performance.now();
+      clearTimeout(S.limpTimer);
+      S.limpTimer = setTimeout(() => {
+        if (S.pc && S.pc.connectionState === 'disconnected') {
+          recoverStep('связь замолчала');
+        }
+      }, 4000);
+    } else {
+      clearTimeout(S.limpTimer);
+    }
+
     switch (state) {
       case 'connected':
+        clearTimeout(S.handshakeTimer);
+        clearTimeout(S.netWatch);
+        S.iceTries = 0;
+        S.disconnectedAt = 0;
         syncStatus();
         setInvite(false);
         applySendParams();
-        applyLatency();
+        applyLatency(true);
         applyAudioProcessing();
         playRemoteAudio();
         sendState();
@@ -1466,25 +1804,60 @@ async function applySendParams() {
     } catch {}
   };
 
-  // Голос важнее картинки: помечаем его высоким приоритетом в сети
-  await tune(S.send.mic, { encoding: { priority: 'high', networkPriority: 'high' } });
+  // Голос важнее картинки: высокий приоритет в сети и запас по битрейту,
+  // которого хватает и мобильному интернету. На плохой сети опускаемся —
+  // Opus с коррекцией ошибок разборчив и на двадцати килобитах.
+  // Верхняя планка поднята: 64 кбит/с Opus — это уже не «телефонный»
+  // голос, а полноценный звук с воздухом. Стоит он копейки на фоне видео,
+  // а разборчивость и усталость от разговора меняет заметно.
+  const voiceBits =
+    S.lossEma > 6 ? 24_000
+    : S.lossEma > 2 ? 32_000
+    : (S.rttVar || 0) > 60 ? 40_000
+    : 64_000;
+  await tune(S.send.mic, {
+    encoding: { priority: 'high', networkPriority: 'high', maxBitrate: voiceBits },
+  });
 
   const step = LADDER[S.quality];
+  // На телефоне поток сверх трёх мегабит не улучшает картинку, зато греет
+  // кодировщик и первым же делом ломает стабильность. iPhone упирается
+  // ещё раньше: его кодер начинает пропускать кадры и греться примерно
+  // с двух с половиной мегабит.
+  const platformCap = PLATFORM.ios ? 2_500_000 : PLATFORM.mobile ? 3_000_000 : Infinity;
+
+  // Измеренный канал делим между двумя картинками. Когда идёт
+  // демонстрация, смотрят прежде всего на неё — ей и большая доля;
+  // лицо в углу переживёт и четверть.
+  const budget = videoBudget();
+  const bothVideo = S.sharing && S.camOn && S.send.cam?.track;
+  const camBudget = budget == null ? Infinity : bothVideo ? budget * 0.3 : budget;
+  const screenBudget = budget == null ? Infinity : bothVideo ? budget * 0.7 : budget;
+
+  const camCap = Math.round(Math.min(step.bitrate, platformCap, camBudget));
+  // Ниже трёх ступеней уменьшаем не только поток, но и само разрешение:
+  // кодировать 720p в четверть мегабита — значит получить кашу вместо лица
+  const scale = S.quality >= 4 ? 3 : S.quality === 3 ? 2 : 1;
   await tune(S.send.cam, {
     encoding: {
       active: !S.voiceOnly,
-      maxBitrate: S.voiceOnly ? 60_000 : step.bitrate,
+      maxBitrate: S.voiceOnly ? 60_000 : camCap,
       maxFramerate: S.voiceOnly ? 5 : step.fps,
-      scaleResolutionDownBy: 1,
+      scaleResolutionDownBy: S.voiceOnly ? 4 : scale,
       networkPriority: S.sharing ? 'low' : 'medium',
     },
-    degradation: 'balanced',
+    // Лицо лучше терять в чёткости, чем в плавности: рваное видео
+    // собеседника раздражает сильнее, чем мягкая картинка. На телефоне
+    // выбираем «баланс»: аппаратный кодер там роняет разрешение дешевле,
+    // чем частоту, и жёсткое требование к плавности только заставляет
+    // его греться и терять кадры пачками.
+    degradation: PLATFORM.mobile ? 'balanced' : 'maintain-framerate',
   });
 
   const preset = SHARE_PRESETS[S.shareQuality] || SHARE_PRESETS.detail;
   await tune(S.send.screen, {
     encoding: {
-      maxBitrate: preset.bitrate,
+      maxBitrate: Math.round(Math.min(preset.bitrate, screenBudget)),
       maxFramerate: preset.fps,
       scaleResolutionDownBy: 1,
       networkPriority: 'high',
@@ -1497,14 +1870,99 @@ async function applySendParams() {
  * Буфер приёма — самая управляемая часть задержки. По умолчанию браузер
  * держит его побольше ради плавности; в режиме низкой задержки убираем.
  */
-function applyLatency() {
+/**
+ * Сколько миллисекунд держать в буфере приёма. Раньше это был выключатель
+ * «ноль или как решит браузер», и на дрожащей сети звук рвался на каждом
+ * скачке. Теперь буфер считается из измеренного дрожания: пакеты приходят
+ * ровно — буфер почти нулевой и разговор живой; сеть заходила — буфер
+ * подрастает и сглаживает рывки, вместо того чтобы щёлкать.
+ */
+function targetBuffer() {
+  if (!S.lowLatency) return null;              // пусть решает браузер
+  const jitter = S.jitterMs || 0;
+  const loss = S.lossEma || 0;
+  // Трёх дрожаний хватает, чтобы перекрыть почти любой всплеск.
+  // Прыгающий пинг — та же неровность, только видна не в джиттере
+  // пакетов, а в задержке пути: её тоже надо перекрывать буфером,
+  // иначе звук щёлкает ровно в моменты скачков.
+  let ms = jitter * 3 + Math.min(120, (S.rttVar || 0) * 1.5)
+         + (loss > 3 ? 60 : loss > 1 ? 25 : 0);
+  return Math.max(0, Math.min(320, Math.round(ms)));
+}
+
+function applyLatency(force) {
   if (!S.pc) return;
-  // На рваной сети маленький буфер вредит больше, чем помогает,
-  // поэтому режим сам отступает и возвращается
-  const short = S.lowLatency && !S.latencyBackoff;
+  const ms = targetBuffer();
+  // Пересчитывается каждую секунду, но трогать приёмники есть смысл
+  // только когда цифра действительно поменялась
+  if (!force && ms === S.bufferMs) return;
+  S.bufferMs = ms;
   for (const r of S.pc.getReceivers()) {
-    try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = short ? 0 : null; } catch {}
-    try { if ('playoutDelayHint' in r) r.playoutDelayHint = short ? 0 : undefined; } catch {}
+    try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = ms; } catch {}
+    // playoutDelayHint измеряется в секундах
+    try { if ('playoutDelayHint' in r) r.playoutDelayHint = ms == null ? undefined : ms / 1000; } catch {}
+  }
+}
+
+/**
+ * Сторож рукопожатия. Прямой путь между двумя NAT строится за секунды;
+ * если за девять его нет, дальше ждать бессмысленно — либо один из
+ * участников за «строгим» NAT, либо VPN не пропускает UDP. Тогда
+ * пересобираем соединение через ретранслятор, если он настроен.
+ */
+function watchHandshake() {
+  clearTimeout(S.handshakeTimer);
+  S.handshakeTimer = setTimeout(async () => {
+    const pc = S.pc;
+    if (!pc || pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
+
+    if (!S.forceRelay && hasRelay()) {
+      setRelayOnly(true, false);
+      logEvent('warn', 'Прямой путь не построился — иду через ретранслятор');
+      toast('Прямое соединение не вышло — пробую через ретранслятор', 3200);
+      await hardRestart(true, 'переход на ретранслятор');
+      return;
+    }
+
+    logEvent('warn', 'Рукопожатие затянулось — пробую заново');
+    try { pc.restartIce(); } catch {}
+    S.connectDeadline = performance.now() + 9000;
+    watchHandshake();
+  }, 9000);
+}
+
+/**
+ * Смена сети — самая частая причина обрыва: телефон уходит с Wi-Fi на
+ * мобильный интернет, кто-то включает или выключает VPN. Браузер сам
+ * заметит это через десятки секунд; мы пересобираем маршрут сразу.
+ */
+function watchNetwork() {
+  const kick = (why) => {
+    if (!S.inCall || !S.pc) return;
+    logEvent('warn', why);
+    reconnect(why);
+    // Если через шесть секунд путь так и не собрался — пересобираем целиком
+    clearTimeout(S.netWatch);
+    S.netWatch = setTimeout(() => {
+      if (S.pc && S.pc.connectionState !== 'connected') hardRestart(true, 'смена сети');
+    }, 6000);
+  };
+
+  addEventListener('online', () => kick('Сеть вернулась'));
+  addEventListener('offline', () => {
+    if (S.inCall) { logEvent('error', 'Сеть пропала'); setStatus('bad', 'Нет сети'); }
+  });
+
+  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (conn && typeof conn.addEventListener === 'function') {
+    let last = conn.type || conn.effectiveType || '';
+    conn.addEventListener('change', () => {
+      const now = conn.type || conn.effectiveType || '';
+      if (now && now !== last) {
+        last = now;
+        kick('Сеть сменилась на ' + now);
+      }
+    });
   }
 }
 
@@ -1532,6 +1990,20 @@ async function hardRestart(notify, reason) {
   S.settingRemoteAnswer = false;
   S.prev = null;
   S.lastRoute = '';
+  S.rttEma = null;
+  S.rttVar = 0;
+  S.shakySince = 0;
+  S.lossEma = 0;
+  S.jitterMs = 0;
+  S.rttWin = [];
+  stopKeepalive();
+  clearTimeout(S.limpTimer);
+  clearTimeout(S.muteTimer);
+  S.rottenSince = 0;
+  S.codecTuned = false;
+  S.bufferMs = undefined;
+  clearTimeout(S.handshakeTimer);
+  clearTimeout(S.netWatch);
   updateChatAvailability();
   setStatus('connecting', 'Пересобираю соединение…');
 
@@ -1611,14 +2083,28 @@ function syncStatus() {
   }
 }
 
-function startStats() {
-  stopStats();
-  S.statsTimer = setInterval(collectStats, 1000);
+function startStats(slow) {
+  clearInterval(S.statsTimer);
+  S.statsSlow = !!slow;
+  S.statsTimer = setInterval(collectStats, slow ? 4000 : 1000);
+}
+
+/**
+ * В свёрнутой вкладке разбор статистики раз в секунду — чистая трата
+ * батареи: на телефоне это заметный нагрев за полчаса разговора. Сам
+ * разговор при этом не страдает, адаптацией качества занимается тот, кто
+ * отдаёт поток, а мы в фоне только принимаем.
+ */
+function pacePolling() {
+  if (!S.statsTimer) return;
+  const slow = document.hidden;
+  if (slow !== S.statsSlow) startStats(slow);
 }
 
 function stopStats() {
   clearInterval(S.statsTimer);
   S.statsTimer = null;
+  S.statsSlow = false;
   $('pingText').textContent = '— мс';
   $('pingText').className = '';
 }
@@ -1634,7 +2120,8 @@ async function collectStats() {
   const acc = {
     rtt: null, jitter: null, buffer: null,
     inBytes: 0, outBytes: 0,
-    audioIn: 0, audioOut: 0, videoInFrames: 0,
+    audioIn: 0, audioOut: 0, videoIn: 0, videoInFrames: 0,
+    bwe: null,
     width: 0, height: 0, fps: 0,
     codec: null, route: null, srtp: null, dtls: null,
     localAddr: null, proto: null, relayProto: null, localType: null, remoteType: null,
@@ -1649,6 +2136,9 @@ async function collectStats() {
   report.forEach((r) => {
     if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) {
       if (r.currentRoundTripTime != null) acc.rtt = r.currentRoundTripTime * 1000;
+      // Оценка пропускной способности. Есть в Chrome и всех, кто на нём
+      // построен; в Safari и Firefox поля просто нет.
+      if (r.availableOutgoingBitrate != null) acc.bwe = r.availableOutgoingBitrate;
       const local = byId.get(r.localCandidateId);
       const remote = byId.get(r.remoteCandidateId);
       if (local && remote) {
@@ -1676,6 +2166,12 @@ async function collectStats() {
       acc.rtt = r.roundTripTime * 1000;
     }
 
+    // Safari на iPhone часто не заполняет ни то, ни другое — тогда берём
+    // собственный замер по каналу данных. Он чуть выше настоящего сетевого
+    // (считается вместе с обработкой на той стороне), но показывает ровно
+    // ту же динамику: скачки видны, и адаптация работает.
+    if (acc.rtt == null && S.dcRtt != null) acc.rtt = S.dcRtt;
+
     if (r.type === 'inbound-rtp' && !r.isRemote) {
       acc.packetsLost += r.packetsLost || 0;
       acc.packetsRecv += r.packetsReceived || 0;
@@ -1686,6 +2182,10 @@ async function collectStats() {
       if (r.kind === 'audio' && r.jitterBufferDelay != null && r.jitterBufferEmittedCount) {
         acc.bufferDelay += r.jitterBufferDelay;
         acc.bufferCount += r.jitterBufferEmittedCount;
+      }
+      if (r.kind === 'video') {
+        acc.videoIn += r.bytesReceived || 0;
+        acc.videoInFrames += r.framesDecoded || 0;
       }
       if (r.kind === 'video' && r.frameWidth) {
         acc.width = r.frameWidth;
@@ -1714,6 +2214,7 @@ async function collectStats() {
   if (acc.bufferCount) acc.buffer = (acc.bufferDelay / acc.bufferCount) * 1000;
 
   let inBps = 0, outBps = 0, lossPct = 0, audioInBps = 0, audioOutBps = 0;
+  let videoInBps = 0, dFrames = 0;
   if (S.prev) {
     const dt = (now - S.prev.t) / 1000;
     if (dt > 0.2) {
@@ -1721,6 +2222,8 @@ async function collectStats() {
       outBps = Math.max(0, ((acc.outBytes - S.prev.out) * 8) / dt);
       audioInBps = Math.max(0, ((acc.audioIn - S.prev.aIn) * 8) / dt);
       audioOutBps = Math.max(0, ((acc.audioOut - S.prev.aOut) * 8) / dt);
+      videoInBps = Math.max(0, ((acc.videoIn - S.prev.vIn) * 8) / dt);
+      dFrames = acc.videoInFrames - S.prev.frames;
       const dLost = acc.packetsLost - S.prev.lost;
       const dRecv = acc.packetsRecv - S.prev.recv;
       if (dLost + dRecv > 0) lossPct = (dLost / (dLost + dRecv)) * 100;
@@ -1729,11 +2232,31 @@ async function collectStats() {
   S.prev = {
     t: now, in: acc.inBytes, out: acc.outBytes,
     aIn: acc.audioIn, aOut: acc.audioOut,
+    vIn: acc.videoIn, frames: acc.videoInFrames,
     lost: acc.packetsLost, recv: acc.packetsRecv,
   };
+  S.outBps = outBps;
+  S.videoInBps = videoInBps;
+
+  // Оценку канала сглаживаем — она заметно дёргается от секунды к секунде,
+  // а решения по ней принимаются каждую секунду.
+  if (acc.bwe != null) {
+    const before = S.bwe;
+    S.bwe = before == null ? acc.bwe : before * 0.7 + acc.bwe * 0.3;
+    S.bweAt = now;
+    S.bweSeen = Math.max(S.bweSeen, S.bwe);
+    // Обвал канала вдвое — это почти всегда переключение сети или
+    // проснувшийся VPN. В журнале это видно куда лучше, чем в цифрах.
+    if (before != null && S.bwe < before * 0.5 && before > 600_000) {
+      logEvent('warn', `Канал просел: ${Math.round(before / 1000)} → ${Math.round(S.bwe / 1000)} кбит/с`);
+    }
+  }
+
+  if (acc.jitter != null) S.jitterMs = S.jitterMs * 0.7 + acc.jitter * 0.3;
 
   renderPing(acc.rtt);
   adaptQuality(acc.rtt, lossPct);
+  watchFrames(dFrames, videoInBps);
   await renderSecurity(acc);
   renderStatsPanel(acc, inBps, outBps, lossPct);
   renderProbe(audioInBps, audioOutBps);
@@ -1816,15 +2339,38 @@ function renderProbe(inBps, outBps) {
  * висит». Ловим это и пробуем пересобрать соединение, но не чаще раза в
  * 20 секунд, чтобы не устроить бесконечный цикл переподключений.
  */
+/**
+ * Присмотр за живым соединением. Кроме замершего видео и потерь ловим
+ * ещё и затянувшуюся деградацию маршрута: если полминуты подряд пинг
+ * за полсекунды или потери выше десяти процентов, разговаривать всё
+ * равно невозможно — проще пересобрать путь, пока связь не оборвалась
+ * сама. Между попытками выдерживаем паузу, иначе лечение станет хуже
+ * болезни.
+ */
 function watchdog(loss) {
   if (!S.pc || S.pc.connectionState !== 'connected') return;
   const now = performance.now();
   const frozen = S.remoteState.cam && frames.cam.at > 0 && now - frames.cam.at > 6000;
   const broken = loss > 25;
+  const rotten = (S.rttEma || 0) > 500 || S.lossEma > 10;
 
-  if (frozen || broken) {
+  if (rotten) {
+    if (!S.rottenSince) S.rottenSince = now;
+  } else {
+    S.rottenSince = 0;
+  }
+  const sustained = S.rottenSince && now - S.rottenSince > 30000;
+
+  if (frozen || broken || sustained) {
     setStatus('bad', frozen ? 'Видео замерло' : 'Канал перегружен');
-    if (now - S.lastRecover > 20000) reconnect(frozen ? 'Видео замерло, пересобираю связь' : 'Связь плохая, пересобираю');
+    if (now - S.lastRecover > 20000) {
+      S.rottenSince = 0;
+      reconnect(
+        frozen ? 'Видео замерло, пересобираю связь'
+        : sustained ? 'Маршрут давно плохой, ищу другой'
+        : 'Связь плохая, пересобираю'
+      );
+    }
   }
 }
 
@@ -1857,10 +2403,21 @@ function renderSpark() {
   $('sparkSummary').textContent = summarizeRtt();
 }
 
+/**
+ * Показываем медиану последних пяти замеров, а не сырое число. Мгновенный
+ * пинг скачет вдвое между соседними секундами даже на хорошей сети — от
+ * этого создаётся ощущение, что связь рвётся, хотя разговор идёт ровно.
+ * График рядом рисуется по сырым значениям: разброс там видно честно.
+ */
 function renderPing(rtt) {
   const el = $('pingText');
   if (rtt == null) { el.textContent = '— мс'; el.className = ''; return; }
-  const ms = Math.round(rtt);
+
+  S.rttWin.push(rtt);
+  if (S.rttWin.length > 5) S.rttWin.shift();
+  const sorted = [...S.rttWin].sort((a, b) => a - b);
+  const ms = Math.round(sorted[Math.floor(sorted.length / 2)]);
+
   el.textContent = ms + ' мс';
   el.className = ms < 80 ? 'is-good' : ms < 200 ? 'is-mid' : 'is-bad';
 
@@ -1870,31 +2427,100 @@ function renderPing(rtt) {
 }
 
 /**
- * Вниз опускаемся сразу, вверх — только после долгой спокойной сети.
- * Когда даже нижняя ступень не спасает, жертвуем видео ради голоса:
- * лучше слышать собеседника, чем смотреть на замерший кадр.
+ * Подстройка качества.
+ *
+ * Главная беда прошлой версии — дёрганье: одна секунда с потерями роняла
+ * ступень, следующая спокойная поднимала обратно, и картинка пульсировала.
+ * Теперь решение принимается по сглаженным величинам (экспоненциальное
+ * среднее), вниз — после двух подряд плохих секунд, вверх — после
+ * пятнадцати спокойных, и между переключениями держится пауза.
+ * Вниз всё равно быстрее, чем вверх: лучше секунду посидеть на низком
+ * качестве, чем десять смотреть на рассыпающийся кадр.
  */
 function adaptQuality(rtt, loss) {
   if (rtt == null) return;
 
-  // Маленький буфер приёма хорош на ровной сети и вреден на рваной
-  const jittery = loss > 4;
-  if (jittery !== S.latencyBackoff) {
-    S.latencyBackoff = jittery;
-    applyLatency();
+  const now = performance.now();
+  // Первые значения принимаем как есть, дальше — сглаживаем
+  const prev = S.rttEma;
+  S.rttEma = prev == null ? rtt : prev * 0.7 + rtt * 0.3;
+  S.lossEma = S.lossEma * 0.7 + loss * 0.3;
+
+  // Разброс пинга. Средний пинг 150 мс — это нормальный разговор;
+  // пинг, скачущий 100→250, звучит рвано при том же среднем. Меряем
+  // именно отклонение от собственного среднего.
+  if (prev != null) {
+    S.rttVar = S.rttVar * 0.8 + Math.abs(rtt - prev) * 0.2;
   }
 
-  const awful = loss > 12;
-  const bad = loss > 4 || rtt > 350;
-  const good = loss < 1.5 && rtt < 180;
+  const r = S.rttEma;
+  const l = S.lossEma;
+  const v = S.rttVar;
+
+  // Буфер приёма пересчитываем постоянно — он и держит ровность звука
+  applyLatency();
+
+  // Скачущий пинг почти всегда означает переполненную очередь на
+  // исходящем канале: мы шлём больше, чем канал вывозит, пакеты копятся
+  // в буфере роутера и задержка гуляет. Лечится это не буфером приёма,
+  // а тем, что мы сами отдаём меньше — поэтому разброс считается
+  // признаком плохой сети наравне с потерями.
+  const shaky = v > 45;
+  if (shaky) {
+    if (!S.shakySince) S.shakySince = now;
+  } else {
+    S.shakySince = 0;
+  }
+  const shakyLong = S.shakySince && now - S.shakySince > 5000;
+
+  const awful = l > 12;
+  const bad = l > 4 || r > 400 || shakyLong;
+  const good = l < 1.2 && r < 200 && v < 25;
+
+  // Канал измерен — верим ему больше, чем косвенным признакам.
+  // Вниз по нему идём почти сразу: смысл всей затеи в том, чтобы
+  // перестать переполнять канал до того, как это станет слышно.
+  const budget = videoBudget();
+  if (budget != null && !S.voiceOnly) {
+    const fit = rungForBudget(budget);
+    if (fit > S.quality && now - (S.qualityAt || 0) > 1500) {
+      S.quality = fit;
+      S.badSince = 0;
+      S.qualityHold = 0;
+      S.qualityAt = now;
+      applySendParams();
+      logEvent(
+        'plain',
+        `Канал ${Math.round(budget / 1000)} кбит/с — качество «${LADDER[S.quality].label}»`
+      );
+      return;
+    }
+    // Канал шире, чем мы шлём, и сеть спокойна — поднимаемся, не выжидая
+    // полминуты. Раньше подъём почти никогда не набирался, и звонок так
+    // и доживал до конца на заниженной картинке.
+    // Для подъёма по измеренному каналу не требуем низкого пинга:
+    // большая задержка сама по себе не мешает толстому потоку, а вот
+    // требование rtt < 200 намертво запирало на «экономном» всех, кто
+    // сидит через VPN или на другом континенте.
+    const steady = l < 2 && v < 30;
+    if (fit < S.quality && steady && now - (S.qualityAt || 0) > 3000) {
+      S.quality--;
+      S.badSince = 0;
+      S.qualityHold = 0;
+      S.qualityAt = now;
+      applySendParams();
+      logEvent('good', `Канал свободен — качество «${LADDER[S.quality].label}»`);
+      return;
+    }
+  }
 
   if (S.voiceOnly) {
-    // Возвращаем видео только после десяти секунд спокойной сети
-    if (loss < 3) {
+    if (l < 3) {
       if (++S.qualityHold >= 10) {
         S.voiceOnly = false;
         S.qualityHold = 0;
         applySendParams();
+        logEvent('good', 'Сеть выправилась — видео вернулось');
         toast('Сеть выправилась — видео снова включено', 2600);
       }
     } else {
@@ -1916,15 +2542,100 @@ function adaptQuality(rtt, loss) {
   }
   if (!awful) S.voiceOnlySince = 0;
 
+  // Пауза между переключениями: без неё качество ходит туда-сюда
+  const settled = now - (S.qualityAt || 0) > 4000;
+
   if (bad && S.quality < LADDER.length - 1) {
-    S.quality++;
-    S.qualityHold = 0;
-    applySendParams();
+    if (++S.badSince >= 2 && settled) {
+      S.quality++;
+      S.badSince = 0;
+      S.qualityHold = 0;
+      S.qualityAt = now;
+      S.shakySince = 0;
+      applySendParams();
+      logEvent(
+        'plain',
+        `Качество снижено до «${LADDER[S.quality].label}»` +
+          (shakyLong ? ` (пинг гуляет на ${Math.round(v)} мс)` : '')
+      );
+    }
   } else if (good && S.quality > 0) {
-    if (++S.qualityHold >= 12) { S.quality--; S.qualityHold = 0; applySendParams(); }
+    S.badSince = 0;
+    // Раньше подъём требовал пятнадцати спокойных секунд подряд — на
+    // живой сети это почти никогда не набиралось, и звонок так и шёл на
+    // заниженном качестве до самого конца. Если пинг ровный, десяти хватает.
+    const need = v < 15 ? 8 : 14;
+    if (++S.qualityHold >= need && settled) {
+      S.quality--;
+      S.qualityHold = 0;
+      S.qualityAt = now;
+      applySendParams();
+      logEvent('good', `Качество поднято до «${LADDER[S.quality].label}»`);
+    }
   } else {
+    S.badSince = 0;
     S.qualityHold = 0;
   }
+}
+
+/**
+ * Замершая картинка при живом соединении.
+ *
+ * Самый неприятный вид поломки: пакеты идут, пинг в порядке, статус
+ * зелёный — а на экране застывший кадр. Обычно это потерянный опорный
+ * кадр: декодер ждёт следующего, а кодер на той стороне считает, что всё
+ * отправил, и шлёт только разницу от кадра, которого у нас нет.
+ * Браузер должен запросить новый сам (PLI), но по дырявому каналу этот
+ * запрос теряется вместе со всем остальным.
+ *
+ * Поэтому просим напрямую, по каналу данных: видео идёт, а кадры не
+ * прибавляются три секунды подряд — значит, декодер стоит.
+ */
+function watchFrames(dFrames, videoInBps) {
+  const live = S.pc?.connectionState === 'connected';
+  const expecting = videoInBps > 20_000;   // картинка действительно передаётся
+  if (!live || !expecting || dFrames > 0) {
+    if (S.frameStall) S.frameStall = 0;
+    return;
+  }
+  if (++S.frameStall < 3) return;
+
+  const now = performance.now();
+  // Ноль означает «ещё ни разу не просили», а не «просили в нулевую
+  // миллисекунду»: без этой оговорки первые секунды жизни страницы
+  // просьба глохла сама собой.
+  if (S.kfAskedAt && now - S.kfAskedAt < 5000) return;
+  S.kfAskedAt = now;
+  logEvent('warn', 'Картинка замерла — прошу опорный кадр');
+  if (!chatSendRaw({ t: 'kf' })) {
+    // Канал данных тоже мёртв — чинить надо соединение целиком
+    recoverStep('картинка замерла, канал данных молчит');
+  }
+}
+
+/**
+ * Пересобрать кодер, чтобы он выдал опорный кадр. Прямого способа
+ * попросить его в WebRTC нет, но выключенная и тут же включённая
+ * дорожка заставляет кодировщик начать с нуля — а это ровно опорный кадр.
+ */
+async function forceKeyframe() {
+  const senders = [S.send.screen];
+  if (!S.voiceOnly) senders.push(S.send.cam);   // в голосовом режиме камера выключена намеренно
+  let done = 0;
+  for (const sender of senders) {
+    if (!sender?.track) continue;
+    try {
+      const off = sender.getParameters();
+      if (!off.encodings?.length) continue;
+      off.encodings[0].active = false;
+      await sender.setParameters(off);
+      const on = sender.getParameters();
+      on.encodings[0].active = true;
+      await sender.setParameters(on);
+      done++;
+    } catch {}
+  }
+  if (done) logEvent('plain', 'Собеседник попросил опорный кадр — кодер пересобран');
 }
 
 async function renderSecurity(acc) {
@@ -1943,8 +2654,10 @@ const STAT_ROWS = [
   ['Буфер приёма', (d) => (d.buffer == null ? '—' : Math.round(d.buffer) + ' мс')],
   ['Потери', (d) => d.loss.toFixed(1) + ' %'],
   ['Джиттер', (d) => (d.jitter == null ? '—' : Math.round(d.jitter) + ' мс')],
+  ['Разброс пинга', () => (S.rttEma == null ? '—' : '±' + Math.round(S.rttVar) + ' мс')],
   ['Приём', (d) => fmtKbps(d.inBps)],
   ['Отдача', (d) => fmtKbps(d.outBps)],
+  ['Канал', () => (S.bwe == null ? '—' : fmtKbps(S.bwe))],
   ['Разрешение', (d) => (d.width ? `${d.width}×${d.height}` : '—')],
   ['Кадры', (d) => (d.fps ? Math.round(d.fps) + ' к/с' : '—')],
 ];
@@ -2007,6 +2720,9 @@ function diagnose(acc) {
   }
   if (vpnish) {
     out.push(`Адрес <b>${addr}</b> похож на VPN или виртуальную сеть. Если звонок не через неё, отключите VPN — станет заметно лучше.`);
+  }
+  if (S.bwe != null && S.bwe < 500_000) {
+    out.push(`Канал сейчас <b>${Math.round(S.bwe / 1000)} кбит/с</b> — этого хватает на голос и небольшую картинку. Качество уже опущено под него автоматически.`);
   }
   if (acc.rtt != null && acc.rtt > 150 && !out.length) {
     out.push('Высокий пинг задан маршрутом до собеседника. Помогают провод вместо Wi-Fi и отключение VPN.');
@@ -2088,12 +2804,19 @@ function bindChat(channel) {
   channel.addEventListener('open', () => {
     updateChatAvailability();
     addSystemMessage('Чат подключён');
+    startKeepalive();
   });
-  channel.addEventListener('close', updateChatAvailability);
+  channel.addEventListener('close', () => { stopKeepalive(); updateChatAvailability(); });
   channel.addEventListener('error', updateChatAvailability);
   channel.addEventListener('message', (e) => {
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
+
+    // Служебные пакеты идут тем же каналом и в переписке не показываются
+    if (msg?.t === 'ping') { chatSendRaw({ t: 'pong', at: msg.at }); return; }
+    if (msg?.t === 'kf') { forceKeyframe(); return; }
+    if (msg?.t === 'pong') { onPong(msg.at); return; }
+
     if (typeof msg?.text !== 'string') return;
     addMessage({
       text: msg.text.slice(0, 2000),
@@ -2102,6 +2825,61 @@ function bindChat(channel) {
     });
   });
   updateChatAvailability();
+}
+
+function chatSendRaw(obj) {
+  if (S.chat?.readyState !== 'open') return false;
+  try { S.chat.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+
+/**
+ * Свой пульс поверх канала данных. Делает сразу три вещи.
+ *
+ * Первое — держит открытыми отображения NAT. Домашний роутер закрывает
+ * тихий UDP-канал за полминуты, мобильный оператор бывает и за пятнадцать
+ * секунд, VPN — почти всегда быстрее всех. Тишина в разговоре не значит
+ * тишину в сети, но для роутера значит именно это: он выкидывает запись,
+ * и звонок умирает молча, без единой ошибки.
+ *
+ * Второе — меряет задержку там, где браузер её не отдаёт. Safari на
+ * iPhone часто не заполняет currentRoundTripTime, и пинг у половины
+ * звонков оставался прочерком.
+ *
+ * Третье — замечает смерть канала раньше, чем это сделает ICE: три
+ * пропущенных ответа подряд означают, что путь уже не работает, хотя
+ * состояние соединения ещё бодро показывает connected.
+ */
+function startKeepalive() {
+  stopKeepalive();
+  S.keepMisses = 0;
+  S.keepTimer = setInterval(() => {
+    if (!S.inCall || S.chat?.readyState !== 'open') return;
+    if (S.dcSentAt) {
+      // На предыдущий пинг ответа не было
+      if (++S.keepMisses === 3) {
+        logEvent('warn', 'Канал данных молчит — проверяю маршрут');
+        recoverStep('канал данных молчит');
+      }
+    }
+    S.dcSentAt = performance.now();
+    if (!chatSendRaw({ t: 'ping', at: S.dcSentAt })) S.dcSentAt = 0;
+  }, 2000);
+}
+
+function stopKeepalive() {
+  clearInterval(S.keepTimer);
+  S.keepTimer = null;
+  S.dcSentAt = 0;
+  S.dcRtt = null;
+  S.keepMisses = 0;
+}
+
+function onPong(at) {
+  if (!at) return;
+  const rtt = performance.now() - at;
+  S.dcRtt = S.dcRtt == null ? rtt : S.dcRtt * 0.6 + rtt * 0.4;
+  S.dcSentAt = 0;
+  S.keepMisses = 0;
 }
 
 function updateChatAvailability() {
@@ -2208,8 +2986,21 @@ $('nameSetting').value = S.name;
    НАСТРОЙКИ
    ═══════════════════════════════════════════════════════════════════ */
 
+/*
+ * Переключатель в настройках. Отсутствующий элемент здесь не должен
+ * ронять всё приложение: разметка и скрипт живут в разных файлах и
+ * обновляются порознь, а одна лишняя строка исключения на этапе
+ * первоначальной привязки не даёт навесить обработчик даже на кнопку
+ * «Создать звонок» — со стороны это выглядит как «сайт умер целиком».
+ * Лучше потерять один выключатель и записать это в журнал.
+ */
 function bindSwitch(id, key, onChange) {
   const el = $(id);
+  if (!el) {
+    logEvent('error', `Не найден переключатель «${id}» — разметка старше скрипта`);
+    S[key] = prefs.get(key, false);
+    return;
+  }
   el.checked = prefs.get(key, el.checked);
   S[key] = el.checked;
   el.addEventListener('change', () => {
@@ -2220,10 +3011,15 @@ function bindSwitch(id, key, onChange) {
 }
 
 bindSwitch('lowLatency', 'lowLatency', (on) => {
-  applyLatency();
+  applyLatency(true);
   toast(on ? 'Низкая задержка включена' : 'Обычный буфер приёма', 1800);
 });
 bindSwitch('shareAudio', 'shareAudio');
+bindSwitch('relayOnly', 'forceRelay', (on) => {
+  logEvent('plain', on ? 'Включён режим «только через ретранслятор»' : 'Ретранслятор больше не обязателен');
+  if (S.inCall && S.peerPresent) hardRestart(true, on ? 'включён ретранслятор' : 'выключен ретранслятор');
+  else toast(on ? 'Применится при следующем звонке' : 'Прямой путь снова разрешён', 2200);
+});
 bindSwitch('mirrorSelf', 'mirror', refreshUi);
 bindSwitch('noiseSuppress', 'noiseSuppress', () => applyAudioProcessing(true));
 bindSwitch('echoCancel', 'echoCancel', () => applyAudioProcessing(true));
@@ -2335,7 +3131,7 @@ let stallTimer = null;
 function watchStall() {
   clearInterval(stallTimer);
   const since = performance.now();
-  let nudged = false;
+  let step = 0;
 
   stallTimer = setInterval(() => {
     if (!S.inCall) return clearInterval(stallTimer);
@@ -2343,16 +3139,38 @@ function watchStall() {
     if (!S.peerPresent) return;              // ждать собеседника — это нормально
 
     const waiting = (performance.now() - since) / 1000;
-    if (waiting > 15 && !nudged) {
-      nudged = true;
+
+    // Первый шаг — просто перебрать пути заново
+    if (waiting > 12 && step === 0) {
+      step = 1;
       reconnect('Соединение затянулось, пробую заново');
-    } else if (waiting > 32) {
+      return;
+    }
+
+    // Второй — уйти на ретранслятор. Именно здесь чинится пара
+    // «один под VPN, другой без»: прямой путь между ними не строится,
+    // сколько ни перебирай, а через ретранслятор соединяются оба.
+    if (waiting > 22 && step === 1) {
+      step = 2;
+      if (hasRelay() && !S.forceRelay) {
+        setRelayOnly(true, false);
+        logEvent('warn', 'Прямой путь не построился — иду через ретранслятор');
+        toast('Прямой путь не строится — пробую через ретранслятор', 3500);
+        hardRestart(true, 'переход на ретранслятор');
+      } else {
+        hardRestart(true, 'соединение не поднимается');
+      }
+      return;
+    }
+
+    if (waiting > 40) {
       clearInterval(stallTimer);
       S.fatal = 'Не удалось соединиться';
       syncStatus();
       toast(
-        'Прямое соединение не установилось. Обычно виноват VPN или строгий фаервол: ' +
-          'попробуйте отключить VPN, либо раздать интернет с телефона.',
+        'Соединение не установилось даже через ретранслятор. Обычно это очень строгий ' +
+          'фаервол или VPN, режущий UDP: попробуйте выключить VPN с одной стороны ' +
+          'или раздать интернет с телефона.',
         9000
       );
     }
@@ -2398,6 +3216,9 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   clearChat();
   updateChatAvailability();
   stopFrameWatch();
+  stopKeepalive();
+  clearTimeout(S.limpTimer);
+  clearTimeout(S.muteTimer);
   $('soundGate').hidden = true;
   for (const id of ['remote-cam', 'remote-screen', 'local-screen']) tileVideo(id).srcObject = null;
   for (const k of Object.keys(remoteTracks)) remoteTracks[k] = null;
@@ -2486,11 +3307,14 @@ addEventListener('keydown', (e) => {
 /* ─────────────── Экономия ресурсов ─────────────── */
 
 document.addEventListener('visibilitychange', () => {
+  pacePolling();
   if (!S.send.cam?.track) return;
   try {
     const p = S.send.cam.getParameters();
     if (!p.encodings?.length) return;
-    p.encodings[0].maxBitrate = document.hidden ? 150_000 : LADDER[S.quality].bitrate;
+    p.encodings[0].maxBitrate = document.hidden
+      ? 150_000
+      : PLATFORM.mobile ? Math.min(LADDER[S.quality].bitrate, 3_000_000) : LADDER[S.quality].bitrate;
     p.encodings[0].maxFramerate = document.hidden ? 8 : LADDER[S.quality].fps;
     S.send.cam.setParameters(p);
   } catch {}
@@ -2512,6 +3336,18 @@ document.addEventListener('visibilitychange', () => {
   if (S.peerPresent && state && state !== 'connected' && state !== 'connecting') {
     logEvent('warn', 'Вернулись в приложение, соединение в состоянии ' + state);
     hardRestart(true, 'возврат из фона');
+  } else if (state === 'connected') {
+    // Соединение формально живо, но пока телефон спал, роутер мог закрыть
+    // отображение. Пинг по каналу данных покажет это за пару секунд —
+    // и сбросит счётчик пропусков, если всё в порядке.
+    S.dcSentAt = 0;
+    S.keepMisses = 0;
+    const muted = Object.values(remoteTracks).some((t) => t && t.muted);
+    if (muted) {
+      logEvent('warn', 'После сна дорожки молчат — проверяю маршрут');
+      S.lastRecover = 0;
+      recoverStep('возврат из сна');
+    }
   }
   playRemoteAudio();
 });
@@ -2529,6 +3365,8 @@ addEventListener('beforeunload', () => {
 });
 
 navigator.mediaDevices?.addEventListener?.('devicechange', listDevices);
+
+watchNetwork();
 
 // Браузер держит звук на паузе до первого действия пользователя — будим его,
 // иначе индикатор речи и сигналы будут молчать при входе по прямой ссылке.
@@ -2558,7 +3396,14 @@ function beep(freq) {
 
 /* Точка для отладки из консоли браузера и для автотестов */
 window.__zv = S;
-window.__zvDebug = { adaptQuality, applySendParams, reconnect, diagnose, LADDER, SHARE_PRESETS };
+window.__zvDebug = {
+  adaptQuality, applySendParams, reconnect, diagnose, tuneSdp,
+  preferCamCodec, preferAudioCodec, camCodecOrder, hasRelay, targetBuffer,
+  logReport, recoverStep, setRelayOnly, pacePolling,
+  videoBudget, rungForBudget, watchFrames, forceKeyframe,
+  LADDER, SHARE_PRESETS, PLATFORM,
+  log: () => LOG.slice(),
+};
 
 /* ─────────────── Старт ─────────────── */
 

@@ -63,11 +63,20 @@ const HEARTBEAT_MS = 25_000;
  * ------------------------------------------------------------------ */
 
 function iceServers() {
+  // Несколько независимых STUN: если один недоступен (провайдер режет,
+  // VPN не пускает), адрес всё равно определится по другому.
   const list = [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
+        'stun:stun.nextcloud.com:443',
+      ],
+    },
   ];
-  // TURN нужен, если оба собеседника за «строгим» NAT (мобильный интернет,
-  // корпоративная сеть). Задаётся переменными окружения — см. README.
+
+  // Свой TURN — задаётся переменными окружения, см. README.
   if (process.env.TURN_URL) {
     list.push({
       urls: process.env.TURN_URL.split(',').map((s) => s.trim()),
@@ -75,6 +84,27 @@ function iceServers() {
       credential: process.env.TURN_PASSWORD || undefined,
     });
   }
+
+  // Запасной ретранслятор. Без него пара «один за строгим NAT, другой под
+  // VPN» не соединяется вообще никак: прямой путь между ними не строится
+  // физически. Публичный, бесплатный, без гарантий — но лучше медленное
+  // соединение, чем никакого. Порты 80 и 443 выбраны нарочно: их не режут
+  // там, где режут всё остальное, а вариант с TCP проходит через сети,
+  // где UDP закрыт целиком.
+  if (process.env.TURN_FALLBACK !== 'off' && !process.env.TURN_URL) {
+    list.push({
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turn:staticauth.openrelay.metered.ca:80',
+        'turn:staticauth.openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    });
+  }
+
   return list;
 }
 

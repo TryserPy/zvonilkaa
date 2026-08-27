@@ -221,10 +221,14 @@
       </button>
     </header>
 
+    <p class="group">Вы</p>
+
     <label class="field">
       <span>Ваше имя</span>
       <input id="nameSetting" type="text" maxlength="24" placeholder="Имя для собеседника" autocomplete="nickname">
     </label>
+
+    <p class="group">Устройства</p>
 
     <label class="field">
       <span>Микрофон</span>
@@ -259,6 +263,8 @@
       <p class="probe__hint" id="probeHint">Скажите что-нибудь: полоска должна двигаться.</p>
     </div>
 
+    <p class="group">Видео и демонстрация</p>
+
     <label class="field">
       <span>Качество демонстрации</span>
       <select id="shareQuality">
@@ -266,6 +272,18 @@
         <option value="motion">Плавность — видео и игры, до 60 к/с</option>
       </select>
     </label>
+    <label class="switch">
+      <input type="checkbox" id="mirrorSelf" checked>
+      <i></i>
+      <span>Зеркалить своё видео<em>Только для вас, собеседник видит вас как есть</em></span>
+    </label>
+    <label class="switch">
+      <input type="checkbox" id="shareAudio" checked>
+      <i></i>
+      <span>Звук при демонстрации<em>Передавать звук вкладки или системы вместе с экраном</em></span>
+    </label>
+
+    <p class="group">Обработка звука</p>
 
     <label class="switch">
       <input type="checkbox" id="noiseSuppress" checked>
@@ -282,29 +300,31 @@
       <i></i>
       <span>Автоусиление громкости<em>Выравнивает тихий и громкий голос</em></span>
     </label>
+
+    <p class="group">Связь</p>
+
     <label class="switch">
       <input type="checkbox" id="lowLatency" checked>
       <i></i>
       <span>Низкая задержка<em>Меньше буфер приёма — звук идёт быстрее. На рваной сети отступает автоматически</em></span>
     </label>
+
     <label class="switch">
-      <input type="checkbox" id="shareAudio" checked>
+      <input type="checkbox" id="relayOnly">
       <i></i>
-      <span>Звук при демонстрации<em>Передавать звук вкладки или системы вместе с экраном</em></span>
-    </label>
-    <label class="switch">
-      <input type="checkbox" id="mirrorSelf" checked>
-      <i></i>
-      <span>Зеркалить своё видео<em>Только для вас, собеседник видит вас как есть</em></span>
+      <span>Всегда через ретранслятор<em>Задержка чуть выше, зато соединяется там, где прямой путь не строится: строгий NAT, VPN, рабочая сеть</em></span>
     </label>
 
-    <div class="field">
-      <span>Свой TURN-сервер, если прямое соединение не строится</span>
-      <input id="turnUrl" type="text" placeholder="turn:адрес:3478" autocomplete="off" spellcheck="false">
-      <input id="turnUser" type="text" placeholder="Пользователь" autocomplete="off" spellcheck="false">
-      <input id="turnPass" type="password" placeholder="Пароль" autocomplete="off">
-      <p class="field__note">Хранится только в этом браузере. Применится при следующей пересборке связи.</p>
-    </div>
+    <details class="adv">
+      <summary>Свой TURN-сервер</summary>
+      <div class="field">
+        <span>Адрес, логин и пароль — если прямое соединение не строится</span>
+        <input id="turnUrl" type="text" placeholder="turn:адрес:3478" autocomplete="off" spellcheck="false">
+        <input id="turnUser" type="text" placeholder="Пользователь" autocomplete="off" spellcheck="false">
+        <input id="turnPass" type="password" placeholder="Пароль" autocomplete="off">
+        <p class="field__note">Хранится только в этом браузере. Применится при следующей пересборке связи.</p>
+      </div>
+    </details>
 
     <button class="btn btn--wide" id="reconnectBtn" type="button">Переподключить связь</button>
     <button class="btn btn--wide" id="restartBothBtn" type="button">Перезапустить звонок у обоих</button>
