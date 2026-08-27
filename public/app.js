@@ -61,6 +61,9 @@ const S = {
   sinkId: '',
   soundBlocked: false,
   audioProcFixed: false,
+  outPeak: 0,
+  inPeak: 0,
+  micPeak: 0,
   speakingSelf: false,
   tick: 0,
   lastRecover: 0,
@@ -635,7 +638,7 @@ function onLevel(who, level) {
   $('probeMic').style.width = pct + '%';
   $('micBtn').style.setProperty('--lvl', level.toFixed(2));
   $('micBtn').style.setProperty('--lvlop', level > 0.04 ? '1' : '0');
-  if (level > 0.05) S.micHeard = true;
+  S.micPeak = Math.max(level, S.micPeak * 0.93);
 }
 
 function onSpeak(who, on) {
@@ -1472,37 +1475,70 @@ async function collectStats() {
   if (++S.tick % 3 === 0) sendState();
 }
 
-/** Что реально происходит со звуком — понятным языком. */
+/**
+ * Что реально происходит со звуком — понятным языком.
+ *
+ * Считать мгновенный битрейт нельзя: Opus с включённым DTX в тишине почти
+ * ничего не передаёт, и честно молчащий микрофон выглядел бы как поломка.
+ * Поэтому смотрим на затухающий пик за последние секунды.
+ */
 function renderProbe(inBps, outBps) {
+  S.outPeak = Math.max(outBps, S.outPeak * 0.9);
+  S.inPeak = Math.max(inBps, S.inPeak * 0.9);
   if ($('settingsPanel').hidden) return;
 
+  const speaking = S.micPeak > 0.08;
+  const outOk = S.outPeak > 2500;
+  const inOk = S.inPeak > 2500;
+
   const out = $('probeOut');
-  const good = outBps > 3000;
-  out.textContent = S.micOn ? (good ? Math.round(outBps / 1000) + ' кбит/с' : 'нет сигнала') : 'выключен';
-  out.className = S.micOn && good ? 'is-good' : 'is-bad';
+  if (!S.micOn) {
+    out.textContent = 'микрофон выключен';
+    out.className = 'is-bad';
+  } else if (outOk) {
+    out.textContent = Math.round(Math.max(outBps, S.outPeak) / 1000) + ' кбит/с';
+    out.className = 'is-good';
+  } else if (!speaking) {
+    out.textContent = 'тишина';
+    out.className = '';
+  } else {
+    out.textContent = 'нет сигнала';
+    out.className = 'is-bad';
+  }
 
   const inc = $('probeIn');
-  const okIn = inBps > 3000;
-  inc.textContent = okIn ? Math.round(inBps / 1000) + ' кбит/с' : (S.peerPresent ? 'тишина' : 'нет собеседника');
-  inc.className = okIn ? 'is-good' : '';
+  if (!S.peerPresent) {
+    inc.textContent = 'нет собеседника';
+    inc.className = '';
+  } else if (inOk) {
+    inc.textContent = Math.round(Math.max(inBps, S.inPeak) / 1000) + ' кбит/с';
+    inc.className = 'is-good';
+  } else {
+    inc.textContent = 'тишина';
+    inc.className = '';
+  }
 
   const hint = $('probeHint');
+  let text = 'Скажите что-нибудь: полоска должна двигаться.';
+  let bad = false;
+
   if (!S.micOn) {
-    hint.textContent = 'Микрофон выключен — включите его кнопкой в панели.';
-    hint.className = 'probe__hint is-bad';
-  } else if (!good && S.peerPresent) {
-    hint.textContent = 'Голос не уходит. Проверьте, тот ли микрофон выбран выше и не заглушён ли он в системе.';
-    hint.className = 'probe__hint is-bad';
+    text = 'Микрофон выключен — включите его кнопкой в панели.';
+    bad = true;
+  } else if (speaking && !outOk) {
+    text = 'Вы говорите, но голос не уходит. Проверьте, тот ли микрофон выбран выше и не заглушён ли он в системе.';
+    bad = true;
   } else if (S.soundBlocked) {
-    hint.textContent = 'Звук собеседника заблокирован браузером — нажмите кнопку вверху экрана.';
-    hint.className = 'probe__hint is-bad';
-  } else if (okIn) {
-    hint.textContent = 'Звук идёт в обе стороны.';
-    hint.className = 'probe__hint';
-  } else {
-    hint.textContent = 'Скажите что-нибудь: полоска должна двигаться.';
-    hint.className = 'probe__hint';
+    text = 'Звук собеседника заблокирован браузером — нажмите кнопку вверху экрана.';
+    bad = true;
+  } else if (outOk && inOk) {
+    text = 'Звук идёт в обе стороны.';
+  } else if (outOk) {
+    text = 'Ваш голос уходит. Собеседник сейчас молчит.';
   }
+
+  hint.textContent = text;
+  hint.className = bad ? 'probe__hint is-bad' : 'probe__hint';
 }
 
 /**
@@ -1719,7 +1755,18 @@ $('shareQuality').addEventListener('change', async (e) => {
 });
 
 $('reconnectBtn').addEventListener('click', () => reconnect());
-$('buildStamp').textContent = 'Сборка от ' + BUILD;
+/*
+ * Отпечаток сборки берём у сервера, а не из константы: так сразу видно,
+ * что именно крутится на этом адресе. Локально и на хостинге они должны
+ * совпадать — если нет, значит развёрнута другая версия.
+ */
+$('buildStamp').textContent = 'Сборка ' + BUILD;
+fetch('/api/health', { cache: 'no-store' })
+  .then((r) => r.json())
+  .then((info) => {
+    if (info?.build) $('buildStamp').textContent = `Сборка ${BUILD} · ${info.build}`;
+  })
+  .catch(() => {});
 
 /* ─────────────── Экраны ─────────────── */
 

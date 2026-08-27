@@ -96,15 +96,51 @@ const MIME = {
 const COMPRESSIBLE = new Set(['.html', '.css', '.js', '.json', '.svg', '.webmanifest']);
 const assetCache = new Map();
 
-function loadAsset(filePath) {
-  const cached = assetCache.get(filePath);
-  const stat = fs.statSync(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs) return cached;
+/**
+ * Отпечаток сборки: короткий хеш от содержимого скриптов и стилей.
+ * Он подставляется в адреса файлов внутри index.html, поэтому после любой
+ * правки браузер запрашивает новый адрес и физически не может отдать старую
+ * версию из кэша — даже если раньше запомнил её надолго.
+ */
+let versionCache = { at: 0, value: 'dev' };
 
-  const raw = fs.readFileSync(filePath);
+function assetVersion() {
+  const now = Date.now();
+  if (now - versionCache.at < 1000) return versionCache.value;
+
+  const hash = crypto.createHash('sha1');
+  for (const name of ['app.js', 'styles.css']) {
+    try {
+      hash.update(fs.readFileSync(path.join(PUBLIC_DIR, name)));
+    } catch {}
+  }
+  versionCache = { at: now, value: hash.digest('hex').slice(0, 10) };
+  return versionCache.value;
+}
+
+function loadAsset(filePath) {
+  const isHtml = filePath.endsWith('.html');
+  const version = isHtml ? assetVersion() : null;
+
+  const cached = assetCache.get(filePath);
+  if (cached && cached.mtimeMs === fs.statSync(filePath).mtimeMs && cached.version === version) {
+    return cached;
+  }
+  const stat = fs.statSync(filePath);
+
+  let raw = fs.readFileSync(filePath);
+  if (isHtml) {
+    raw = Buffer.from(
+      raw
+        .toString('utf8')
+        .replace(/(["'])\/(app\.js|styles\.css)\1/g, `$1/$2?v=${version}$1`),
+      'utf8'
+    );
+  }
   const ext = path.extname(filePath).toLowerCase();
   const entry = {
     mtimeMs: stat.mtimeMs,
+    version,
     type: MIME[ext] || 'application/octet-stream',
     raw,
     gzip: COMPRESSIBLE.has(ext) ? zlib.gzipSync(raw, { level: 9 }) : null,
@@ -205,7 +241,12 @@ const requestHandler = (req, res) => {
     return sendJson(res, 200, { iceServers: iceServers() });
   }
   if (url === '/api/health') {
-    return sendJson(res, 200, { ok: true, rooms: rooms.size, uptime: process.uptime() });
+    return sendJson(res, 200, {
+      ok: true,
+      build: assetVersion(),
+      rooms: rooms.size,
+      uptime: Math.round(process.uptime()),
+    });
   }
 
   const filePath = resolveStaticPath(url);
