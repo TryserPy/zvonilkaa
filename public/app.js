@@ -279,7 +279,12 @@ async function ensureMedia() {
 
   for (const c of attempts) {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia(c);
+      // Занятая другой программой камера умеет не отвечать вовсе,
+      // поэтому ждём её ограниченное время и идём дальше
+      const stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia(c),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 12000)),
+      ]);
       adoptCamStream(stream);
       if (!c.video) {
         S.camOn = false;
@@ -287,13 +292,16 @@ async function ensureMedia() {
       }
       return stream;
     } catch (err) {
-      if (err.name === 'NotAllowedError') {
+      if (err?.name === 'NotAllowedError') {
         toast('Доступ к камере и микрофону запрещён. Разрешите его в настройках сайта.', 6000);
         return null;
       }
+      if (err?.message === 'timeout' && c.video) {
+        toast('Камера не отвечает — возможно, занята другой программой. Пробую только звук.', 6000);
+      }
     }
   }
-  toast('Не удалось получить доступ к устройствам', 5000);
+  toast('Не удалось получить доступ к устройствам. Звонок продолжится без них.', 6000);
   return null;
 }
 
@@ -317,6 +325,7 @@ function adoptCamStream(stream) {
   watchLevel('self', stream);
   listDevices();
   refreshUi();
+  if (S.pc) bindRoles();   // соединение уже могло подняться без нас
 }
 
 const tileEl = (id) => document.querySelector(`.tile[data-src="${id}"]`);
@@ -1015,6 +1024,7 @@ function connectSignaling() {
 
   ws.addEventListener('open', () => {
     S.wsRetry = 0;
+    setStatus('connecting', 'Вхожу в комнату…');
     ws.send(JSON.stringify({ type: 'join', roomId: S.roomId }));
   });
 
@@ -1422,7 +1432,7 @@ function syncStatus() {
   switch (pc.connectionState) {
     case 'connected': setStatus('live', 'На связи'); break;
     case 'new':
-    case 'connecting': setStatus('connecting', 'Подключение…'); break;
+    case 'connecting': setStatus('connecting', 'Устанавливаю соединение…'); break;
     case 'disconnected': setStatus('bad', 'Связь нестабильна'); break;
     case 'failed': setStatus('bad', 'Связь потеряна'); break;
   }
@@ -2170,20 +2180,64 @@ async function enterCall(roomId, roomKey = null) {
   setInvite(false);
 
   show('call');
-  setStatus('connecting', 'Подключение…');
+  setStatus('connecting', 'Соединяюсь с сервером…');
 
-  await ensureMedia();
+  // К серверу идём сразу, не дожидаясь камеры. Раньше было наоборот, и
+  // если getUserMedia подвисал — а он подвисает, когда камеру держит другая
+  // программа, — звонок навсегда застревал на «Подключение…».
   startFrameWatch();
   hintOnce();
   updateChatAvailability();
+  refreshUi();
+  connectSignaling();
+  requestWakeLock();
+  watchStall();
+
+  setStatus('connecting', 'Спрашиваю доступ к камере и микрофону…');
+  await ensureMedia();
+  syncStatus();
+
+  // Дорожки приехали позже соединения — прикрепляем их сейчас
+  if (S.pc) await bindRoles();
+
   S.sinkId = prefs.get('sink', '');
   if (S.sinkId) setSink(S.sinkId);
 
   const savedBg = prefs.get('bg', 'off');
   if (savedBg !== 'off' && S.local.cam) applyBackground(savedBg);
   refreshUi();
-  connectSignaling();
-  requestWakeLock();
+}
+
+/**
+ * Если соединение не поднимается слишком долго, человек должен узнать об
+ * этом словами, а не смотреть на вечное «Подключение…».
+ */
+let stallTimer = null;
+function watchStall() {
+  clearInterval(stallTimer);
+  const since = performance.now();
+  let nudged = false;
+
+  stallTimer = setInterval(() => {
+    if (!S.inCall) return clearInterval(stallTimer);
+    if (S.pc?.connectionState === 'connected') { clearInterval(stallTimer); return; }
+    if (!S.peerPresent) return;              // ждать собеседника — это нормально
+
+    const waiting = (performance.now() - since) / 1000;
+    if (waiting > 15 && !nudged) {
+      nudged = true;
+      reconnect('Соединение затянулось, пробую заново');
+    } else if (waiting > 32) {
+      clearInterval(stallTimer);
+      S.fatal = 'Не удалось соединиться';
+      syncStatus();
+      toast(
+        'Прямое соединение не установилось. Обычно виноват VPN или строгий фаервол: ' +
+          'попробуйте отключить VPN, либо раздать интернет с телефона.',
+        9000
+      );
+    }
+  }, 1000);
 }
 
 /** Одна подсказка за всё время: как переключать окна. Дальше молчим. */
@@ -2218,6 +2272,7 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.mainLocked = false;
   S.chat = null;
   S.peerName = '';
+  clearInterval(stallTimer);
   clearChat();
   updateChatAvailability();
   stopFrameWatch();
