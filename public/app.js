@@ -51,6 +51,15 @@ const S = {
   remoteState: { mic: true, cam: false, screen: false },
   remoteKnown: false,
 
+  name: '',
+  peerName: '',
+  chat: null,        // канал данных
+  chatOpen: false,
+  unread: 0,
+  bg: 'off',         // off | blur | g1 | g2 | g3 | custom
+  bgNative: false,   // размытие делает сам браузер
+  rawCam: null,      // исходная дорожка камеры до обработки
+
   lowLatency: true,
   latencyBackoff: false,
   shareQuality: 'detail',
@@ -410,6 +419,12 @@ function fillSelect(select, devices, fallback) {
 /** Смена микрофона или камеры без разрыва звонка. */
 async function switchDevice(kind, deviceId) {
   if (!S.camStream) return;
+
+  // Обработку фона на время смены камеры снимаем: она держит старую
+  // дорожку, и без этого в отправку ушёл бы застывший кадр
+  const bgWas = kind === 'video' && S.bg !== 'off' ? S.bg : null;
+  if (bgWas) await applyBackground('off');
+
   try {
     const constraints =
       kind === 'audio'
@@ -437,6 +452,8 @@ async function switchDevice(kind, deviceId) {
     toast(kind === 'audio' ? 'Микрофон переключён' : 'Камера переключена', 1600);
   } catch {
     toast('Не удалось переключить устройство');
+  } finally {
+    if (bgWas) await applyBackground(bgWas);
   }
 }
 
@@ -963,8 +980,28 @@ function refreshUi() {
   tileEl('local-cam').querySelector('.ic-badge--mic').hidden = S.micOn;
   tileEl('remote-cam').querySelector('.ic-badge--mic').hidden = S.remoteState.mic !== false;
 
+  // Имена вместо безликих «Вы» и «Собеседник»
+  const me = S.name || 'Вы';
+  const peer = S.peerName || 'Собеседник';
+  tileEl('local-cam').querySelector('.tile__label span').textContent = me;
+  tileEl('remote-cam').querySelector('.tile__label span').textContent = peer;
+  tileEl('local-screen').querySelector('.tile__label span').textContent = 'Ваш экран';
+  tileEl('remote-screen').querySelector('.tile__label span').textContent =
+    S.peerName ? `Экран: ${S.peerName}` : 'Экран собеседника';
+  tileEl('local-cam').querySelector('.avatar').textContent = initials(me);
+  $('remoteAvatar').textContent = initials(peer);
+
   $('tiles').classList.toggle('no-mirror', !S.mirror);
   $('stageEmpty').hidden = !!S.main;
+}
+
+/** Одна-две буквы для кружка вместо аватарки. */
+function initials(name) {
+  const parts = String(name).trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '·';
+  const first = [...parts[0]][0] || '';
+  const second = parts[1] ? [...parts[1]][0] : '';
+  return (first + second).toUpperCase();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1018,6 +1055,7 @@ function sendState() {
       cam: (S.camOn && !!S.local.cam) || false,
       screen: S.sharing,
       speaking: !!S.speakingSelf && S.micOn,
+      name: S.name || '',
     },
   });
 }
@@ -1039,6 +1077,7 @@ async function handleSignal(m) {
       S.peerPresent = true;
       setInvite(false);
       beep(660);
+      addSystemMessage('Собеседник присоединился');
       await startPeerConnection();
       sendState();
       refreshUi();
@@ -1086,6 +1125,7 @@ async function onRemoteSignal(payload) {
   if (data.state) {
     S.remoteState = { ...S.remoteState, ...data.state };
     S.remoteKnown = true;
+    S.peerName = String(data.state.name || '').slice(0, 24);
     onSpeak('peer', !!data.state.speaking);
     refreshUi();
     return;
@@ -1207,12 +1247,19 @@ async function startPeerConnection() {
     }
   });
 
+  // Канал для чата. Создаёт его тоже инициатор, до первого оффера, —
+  // тогда он попадает в то же согласование и не требует отдельного круга
+  // переговоров. Второй участник получает готовый канал событием.
+  pc.addEventListener('datachannel', (e) => bindChat(e.channel));
+
   // Дорожки создаёт только инициатор — первый, кто оказался в комнате.
   // По спецификации транссиверы, созданные через addTransceiver, не
   // переиспользуются при входящем оффере: если бы их создавали обе стороны,
   // получилось бы восемь потоков вместо четырёх. Второй участник подхватит
   // уже готовые в bindRoles() после того, как применит оффер.
   if (!S.polite) {
+    bindChat(pc.createDataChannel('chat', { ordered: true }));
+
     const transceivers = ROLES.map((role) =>
       pc.addTransceiver(role === 'cam' || role === 'screen' ? 'video' : 'audio', {
         direction: 'sendrecv',
@@ -1334,12 +1381,16 @@ function onPeerLeft() {
   frames.screen = { at: 0, mark: -1 };
   $('soundGate').hidden = true;
 
-  $('stageEmptyText').textContent = 'Собеседник вышел';
+  $('stageEmptyText').textContent = S.peerName ? `${S.peerName} вышел` : 'Собеседник вышел';
+  addSystemMessage(S.peerName ? `${S.peerName} вышел из звонка` : 'Собеседник вышел из звонка');
+  S.peerName = '';
   setInvite(true);
   setStatus('connecting', 'Ждём собеседника');
 
   S.pc?.close();
   S.pc = null;
+  S.chat = null;
+  updateChatAvailability();
   S.send = { mic: null, cam: null, screen: null, screenAudio: null };
   S.prev = null;
   stopStats();
@@ -1735,15 +1786,35 @@ function diagnose(acc) {
    ПАНЕЛИ И НАВИГАЦИЯ
    ═══════════════════════════════════════════════════════════════════ */
 
+const PANELS = [
+  ['statsPanel', 'statsBtn'],
+  ['settingsPanel', 'settingsBtn'],
+  ['chatPanel', 'chatBtn'],
+];
+
+/** Панели существуют по очереди: на телефоне двум сразу просто негде. */
 function togglePanel(id, btnId) {
   const panel = $(id);
-  const other = id === 'statsPanel' ? 'settingsPanel' : 'statsPanel';
-  const otherBtn = id === 'statsPanel' ? 'settingsBtn' : 'statsBtn';
-  $(other).hidden = true;
-  $(otherBtn).setAttribute('aria-pressed', 'false');
+  const opening = panel.hidden;
 
-  panel.hidden = !panel.hidden;
-  $(btnId).setAttribute('aria-pressed', String(!panel.hidden));
+  for (const [otherId, otherBtn] of PANELS) {
+    if (otherId === id) continue;
+    $(otherId).hidden = true;
+    $(otherBtn).setAttribute('aria-pressed', 'false');
+  }
+
+  panel.hidden = !opening;
+  $(btnId).setAttribute('aria-pressed', String(opening));
+
+  if (id === 'chatPanel') {
+    S.chatOpen = opening;
+    if (opening) {
+      S.unread = 0;
+      renderUnread();
+      setTimeout(() => $('chatInput').focus({ preventScroll: true }), 60);
+      scrollChat();
+    }
+  }
 }
 
 $('statsBtn').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
@@ -1752,6 +1823,273 @@ $('statsClose').addEventListener('click', () => togglePanel('statsPanel', 'stats
 $('lockPill').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
 $('settingsBtn').addEventListener('click', () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); });
 $('settingsClose').addEventListener('click', () => togglePanel('settingsPanel', 'settingsBtn'));
+$('chatBtn').addEventListener('click', () => togglePanel('chatPanel', 'chatBtn'));
+$('chatClose').addEventListener('click', () => togglePanel('chatPanel', 'chatBtn'));
+
+/* ═══════════════════════════════════════════════════════════════════
+   ЧАТ
+   ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * Сообщения идут по каналу данных WebRTC — то есть напрямую собеседнику
+ * и под тем же шифрованием DTLS, что и видео. Сервер их не видит вовсе,
+ * история нигде не сохраняется и исчезает вместе со звонком.
+ */
+
+function bindChat(channel) {
+  S.chat = channel;
+  channel.addEventListener('open', () => {
+    updateChatAvailability();
+    addSystemMessage('Чат подключён');
+  });
+  channel.addEventListener('close', updateChatAvailability);
+  channel.addEventListener('error', updateChatAvailability);
+  channel.addEventListener('message', (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (typeof msg?.text !== 'string') return;
+    addMessage({
+      text: msg.text.slice(0, 2000),
+      who: String(msg.name || '').slice(0, 24) || S.peerName || 'Собеседник',
+      own: false,
+    });
+  });
+  updateChatAvailability();
+}
+
+function updateChatAvailability() {
+  const ready = S.chat?.readyState === 'open';
+  $('chatInput').disabled = !ready;
+  $('chatSend').disabled = !ready;
+  $('chatInput').placeholder = ready ? 'Сообщение' : 'Ждём собеседника…';
+}
+
+function addMessage({ text, who, own }) {
+  $('chatEmpty').hidden = true;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg' + (own ? ' msg--own' : '');
+
+  const label = document.createElement('p');
+  label.className = 'msg__who';
+  label.textContent = own ? (S.name || 'Вы') : who;
+
+  const body = document.createElement('div');
+  body.className = 'msg__body';
+  body.textContent = text; // именно textContent: разметка из чата не исполняется
+
+  wrap.append(label, body);
+  $('chatLog').append(wrap);
+  scrollChat();
+
+  if (!own && !S.chatOpen) {
+    S.unread++;
+    renderUnread();
+    beep(760);
+  }
+}
+
+function addSystemMessage(text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg--sys';
+  const body = document.createElement('div');
+  body.className = 'msg__body';
+  body.textContent = text;
+  wrap.append(body);
+  $('chatLog').append(wrap);
+  scrollChat();
+}
+
+function scrollChat() {
+  const log = $('chatLog');
+  log.scrollTop = log.scrollHeight;
+}
+
+function renderUnread() {
+  const badge = $('chatBadge');
+  badge.hidden = S.unread === 0;
+  badge.textContent = S.unread > 9 ? '9+' : String(S.unread);
+}
+
+function clearChat() {
+  $('chatLog').querySelectorAll('.msg').forEach((el) => el.remove());
+  $('chatEmpty').hidden = false;
+  S.unread = 0;
+  renderUnread();
+}
+
+$('chatForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text || S.chat?.readyState !== 'open') return;
+
+  try {
+    S.chat.send(JSON.stringify({ text, name: S.name || '' }));
+    addMessage({ text, who: S.name || 'Вы', own: true });
+    input.value = '';
+  } catch {
+    toast('Сообщение не ушло — связь прервалась');
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   ИМЯ
+   ═══════════════════════════════════════════════════════════════════ */
+
+let nameTimer;
+function setName(value, from) {
+  S.name = String(value || '').slice(0, 24);
+  prefs.set('name', S.name);
+  for (const id of ['nameInput', 'nameSetting']) {
+    if (id !== from) $(id).value = S.name;
+  }
+  refreshUi();
+  clearTimeout(nameTimer);
+  nameTimer = setTimeout(sendState, 400);
+}
+
+for (const id of ['nameInput', 'nameSetting']) {
+  $(id).addEventListener('input', (e) => setName(e.target.value, id));
+}
+
+S.name = prefs.get('name', '');
+$('nameInput').value = S.name;
+$('nameSetting').value = S.name;
+
+/* ═══════════════════════════════════════════════════════════════════
+   ФОН
+   ═══════════════════════════════════════════════════════════════════ */
+
+const GRADIENTS = {
+  g1: ['#f6d365', '#fda085'],
+  g2: ['#6ec3f4', '#3a7bd5'],
+  g3: ['#3a3d55', '#0f1020'],
+};
+
+const gradientCache = {};
+
+function gradientImage(id) {
+  if (gradientCache[id]) return gradientCache[id];
+  const canvas = document.createElement('canvas');
+  canvas.width = 960;
+  canvas.height = 540;
+  const ctx = canvas.getContext('2d');
+  const [from, to] = GRADIENTS[id];
+  const fill = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+  fill.addColorStop(0, from);
+  fill.addColorStop(1, to);
+  ctx.fillStyle = fill;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const img = new Image();
+  img.src = canvas.toDataURL('image/jpeg', 0.9);
+  gradientCache[id] = img;
+  return img;
+}
+
+let customImage = null;
+
+function bgNote(text, warn) {
+  const note = $('bgNote');
+  note.textContent = text || '';
+  note.hidden = !text;
+  note.className = warn ? 'field__note is-warn' : 'field__note';
+}
+
+/** Ставит дорожку камеры и в отправку, и в локальные превью. */
+async function useCamTrack(track) {
+  if (!track || !S.camStream) return;
+  track.enabled = S.camOn;
+
+  const old = S.camStream.getVideoTracks()[0];
+  if (old && old !== track) S.camStream.removeTrack(old);
+  if (!S.camStream.getVideoTracks().includes(track)) S.camStream.addTrack(track);
+  S.local.cam = track;
+
+  if (S.send.cam) {
+    try { await S.send.cam.replaceTrack(track); } catch {}
+  }
+  $('previewVideo').srcObject = S.camStream;
+  tileVideo('local-cam').srcObject = S.camStream;
+  refreshUi();
+}
+
+/**
+ * Переключает обработку фона. Порядок важен: сначала полностью снимаем
+ * предыдущий режим и возвращаем исходную дорожку, потом включаем новый —
+ * иначе после пары переключений в отправку уходит мёртвый холст.
+ */
+async function applyBackground(mode) {
+  S.bg = mode;
+  prefs.set('bg', mode === 'custom' ? 'off' : mode);
+  for (const button of $('bgPicker').children) {
+    button.setAttribute('aria-pressed', String(button.dataset.bg === mode));
+  }
+
+  const raw = S.rawCam || S.local.cam;
+  if (!raw) return bgNote('Сначала включите камеру', true);
+
+  // Снимаем всё, что было включено раньше
+  if (S.bgNative) {
+    await window.Effects.applyNative(raw, false);
+    S.bgNative = false;
+  }
+  if (window.Effects.active) {
+    window.Effects.stop();
+    await useCamTrack(raw);
+  }
+  S.rawCam = null;
+
+  if (mode === 'off') return bgNote('');
+
+  // Если браузер умеет размывать сам — отдаём работу ему: качество лучше,
+  // а процессор вообще не задействован
+  if (mode === 'blur' && window.Effects.nativeSupported()) {
+    if (await window.Effects.applyNative(raw, true)) {
+      S.bgNative = true;
+      return bgNote('Размытие выполняет сам браузер — без нагрузки на процессор');
+    }
+  }
+
+  if (mode !== 'blur') {
+    const image = mode === 'custom' ? customImage : gradientImage(mode);
+    if (!image) return bgNote('Картинка не выбрана', true);
+    window.Effects.setImage(image);
+  }
+
+  const processed = await window.Effects.start(raw, mode === 'blur' ? 'blur' : 'image');
+  if (!processed) return bgNote('Не удалось включить обработку', true);
+
+  S.rawCam = raw;
+  await useCamTrack(processed);
+  bgNote(
+    mode === 'blur'
+      ? 'Портретный режим: резким остаётся мягкий овал вокруг вас, остальное размыто. Это не вырезание по контуру.'
+      : 'Фон подменяется вокруг мягкого овала. Овал сам держится за того, кто движется в кадре.'
+  );
+}
+
+$('bgPicker').addEventListener('click', (e) => {
+  const button = e.target.closest('.bg');
+  if (!button) return;
+  if (button.dataset.bg === 'custom') return $('bgFile').click();
+  applyBackground(button.dataset.bg);
+});
+
+$('bgFile').addEventListener('change', (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => { customImage = img; applyBackground('custom'); };
+    img.onerror = () => bgNote('Не удалось прочитать картинку', true);
+    img.src = reader.result;   // остаётся в браузере, никуда не отправляется
+  };
+  reader.readAsDataURL(file);
+  e.target.value = '';
+});
 
 /* Переключатели в настройках */
 function bindSwitch(id, key, onChange) {
@@ -1825,7 +2163,6 @@ async function enterCall(roomId, roomKey = null) {
     ? 'Сигналинг зашифрован ключом из ссылки, сервер видит только шифротекст'
     : 'Медиапоток зашифрован, но ключа комнаты в ссылке нет';
 
-  $('remoteAvatar').textContent = roomId[0].toUpperCase();
   $('inviteLink').value = location.origin + '/' + roomId + suffix;
   $('shareBtn').hidden = !navigator.share;
   $('shareScreenBtn').hidden = !navigator.mediaDevices?.getDisplayMedia;
@@ -1838,8 +2175,12 @@ async function enterCall(roomId, roomKey = null) {
   await ensureMedia();
   startFrameWatch();
   hintOnce();
+  updateChatAvailability();
   S.sinkId = prefs.get('sink', '');
   if (S.sinkId) setSink(S.sinkId);
+
+  const savedBg = prefs.get('bg', 'off');
+  if (savedBg !== 'off' && S.local.cam) applyBackground(savedBg);
   refreshUi();
   connectSignaling();
   requestWakeLock();
@@ -1875,6 +2216,10 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.voiceOnlySince = 0;
   S.main = null;
   S.mainLocked = false;
+  S.chat = null;
+  S.peerName = '';
+  clearChat();
+  updateChatAvailability();
   stopFrameWatch();
   $('soundGate').hidden = true;
   for (const id of ['remote-cam', 'remote-screen', 'local-screen']) tileVideo(id).srcObject = null;
@@ -1935,6 +2280,7 @@ const KEYS = {
   a: () => { setSpeaker(!S.speakerOn); toast(S.speakerOn ? 'Звук включён' : 'Звук выключен', 1200); },
   s: () => togglePanel('statsPanel', 'statsBtn'),
   k: () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); },
+  c: () => togglePanel('chatPanel', 'chatBtn'),
   r: () => reconnect(),
   e: () => endCall(),
   f: () => {
@@ -1944,7 +2290,7 @@ const KEYS = {
   },
 };
 // Раскладка не должна мешать: те же клавиши в кириллице
-const RU = { ь: 'm', м: 'v', в: 'd', ф: 'a', ы: 's', л: 'k', у: 'e', а: 'f', к: 'r' };
+const RU = { ь: 'm', м: 'v', в: 'd', ф: 'a', ы: 's', л: 'k', у: 'e', а: 'f', к: 'r', с: 'c' };
 
 addEventListener('keydown', (e) => {
   if (!S.inCall || e.metaKey || e.ctrlKey || e.altKey) return;

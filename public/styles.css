@@ -409,6 +409,53 @@ button { cursor: pointer; background: none; border: 0; }
   max-height: calc(100dvh - 190px); overflow-y: auto;
 }
 .panel--settings { left: 14px; right: auto; }
+.panel--chat { left: auto; right: 14px; display: flex; flex-direction: column; overflow: hidden; }
+
+/* ───────────── Чат ───────────── */
+
+.chat__log {
+  flex: 1; min-height: 180px; max-height: 46dvh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+  padding-right: 4px; margin-bottom: 10px;
+}
+.chat__empty { font-size: 11.5px; color: var(--muted); line-height: 1.45; text-align: center; margin: auto 0; padding: 12px 6px; }
+
+.msg { max-width: 86%; align-self: flex-start; animation: pop .3s var(--spring) both; }
+.msg--own { align-self: flex-end; }
+.msg__who { font-size: 10.5px; color: var(--muted); margin: 0 0 3px 10px; }
+.msg--own .msg__who { text-align: right; margin: 0 10px 3px 0; }
+.msg__body {
+  padding: 8px 12px; border-radius: 14px; font-size: 13.5px; line-height: 1.4;
+  background: var(--surface-2); border: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.msg--own .msg__body { background: var(--accent); border-color: transparent; color: var(--accent-ink); }
+.msg__body a { color: inherit; }
+.msg--sys { align-self: center; max-width: 100%; }
+.msg--sys .msg__body { background: none; border: 0; color: var(--muted); font-size: 11.5px; padding: 2px; }
+
+.chat__form { display: flex; gap: 8px; }
+.chat__form input {
+  flex: 1; min-width: 0; height: 42px; padding: 0 13px; border-radius: 12px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  transition: border-color .16s;
+}
+.chat__form input:focus { outline: none; border-color: var(--accent); }
+.chat__send {
+  width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-ink);
+  transition: transform .18s var(--spring), opacity .16s;
+}
+.chat__send:active { transform: scale(.92); }
+.chat__send:disabled { opacity: .4; cursor: default; }
+
+/* Счётчик непрочитанного на кнопке */
+.ctrl__badge {
+  position: absolute; top: 4px; right: 6px; min-width: 17px; height: 17px;
+  padding: 0 4px; border-radius: 9px; background: var(--danger); color: #fff;
+  font-size: 10px; line-height: 17px; text-align: center; font-variant-numeric: tabular-nums;
+  animation: pop .3s var(--spring) both;
+}
 .panel header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .panel h2 { font-size: 13px; font-weight: 540; letter-spacing: -.01em; }
 
@@ -426,6 +473,40 @@ button { cursor: pointer; background: none; border: 0; }
   max-width: 100%; text-overflow: ellipsis; transition: border-color .16s;
 }
 .field select:focus { outline: none; border-color: var(--accent); }
+.field input[type="text"] {
+  height: 38px; padding: 0 12px; border-radius: 10px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  transition: border-color .16s;
+}
+.field input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
+/* Имя в лобби */
+.namefield { display: grid; gap: 5px; font-size: 12px; color: var(--muted); margin-top: 22px; max-width: 320px; }
+.namefield input {
+  height: 44px; padding: 0 14px; border-radius: 11px;
+  background: var(--surface); border: 1px solid var(--line-strong);
+  transition: border-color .16s, box-shadow .16s;
+}
+.namefield input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.namefield input::placeholder { color: var(--muted); }
+
+/* Выбор фона */
+.bg-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.bg {
+  display: grid; place-items: center; gap: 4px; padding: 9px 4px;
+  border-radius: 10px; border: 1px solid var(--line);
+  background: var(--surface-2); color: var(--text);
+  transition: border-color .16s, background .16s, transform .18s var(--spring);
+}
+.bg:active { transform: scale(.95); }
+.bg em { font-style: normal; font-size: 10px; color: var(--muted); }
+.bg svg { width: 20px; height: 20px; }
+.bg__sw { width: 20px; height: 20px; border-radius: 6px; display: block; }
+.bg__g1 { background: linear-gradient(140deg, #f6d365, #fda085); }
+.bg__g2 { background: linear-gradient(140deg, #6ec3f4, #3a7bd5); }
+.bg__g3 { background: linear-gradient(140deg, #35374a, #0f1020); }
+.bg[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface-2)); }
+.bg[aria-pressed="true"] em { color: var(--text); }
 
 /* Проверка звука */
 .probe {
@@ -564,18 +645,20 @@ button { cursor: pointer; background: none; border: 0; }
   .tiles { --tw: 27vw; --gap: 8px; --top0: calc(54px + env(safe-area-inset-top)); }
   .tile.is-thumb { left: calc(100% - var(--tw) - 10px); }
 
-  /* Подписи под иконками остаются: без них панель — ребус */
-  .ctrl { width: 52px; height: 54px; gap: 2px; }
-  .ctrl em { display: block; font-size: 9px; }
+  /* Подписи под иконками остаются: без них панель — ребус.
+     Кнопок семь, поэтому берём короткие варианты подписей. */
+  .ctrl { width: 48px; height: 54px; gap: 2px; }
+  .ctrl em { display: block; font-size: 0; }
+  .ctrl em::after { content: attr(data-short); font-size: 8.5px; letter-spacing: -.02em; }
   .ctrl svg { width: 21px; height: 21px; }
-  .ctrl--end { width: 58px; }
+  .ctrl--end { width: 54px; }
   .ctrl--only-wide { display: none; }
-  .dock { border-radius: 18px; gap: 2px; padding: 6px 7px; }
+  .dock { border-radius: 18px; gap: 2px; padding: 6px; }
 
   .stats.panel { left: 12px; right: 12px; width: auto; bottom: calc(96px + env(safe-area-inset-bottom)); }
 
-  /* Настройки — шторка снизу во всю ширину */
-  .panel--settings {
+  /* Настройки и чат — шторки снизу во всю ширину */
+  .panel--settings, .panel--chat {
     left: 0; right: 0; bottom: 0; width: auto;
     border-radius: var(--r-lg) var(--r-lg) 0 0;
     border-left: 0; border-right: 0; border-bottom: 0;
@@ -583,12 +666,20 @@ button { cursor: pointer; background: none; border: 0; }
     padding: 8px 18px calc(22px + env(safe-area-inset-bottom));
     animation: sheetUp .34s var(--ease) both;
   }
-  .panel--settings .sheet-grip {
+  .panel--settings .sheet-grip, .panel--chat .sheet-grip {
     display: block; width: 38px; height: 4px; border-radius: 3px;
     background: var(--line-strong); margin: 0 auto 10px;
   }
-  .panel--settings header { position: sticky; top: 0; background: var(--surface); padding-bottom: 8px; z-index: 1; }
-  .panel--settings h2 { font-size: 15px; }
+  .panel--settings header, .panel--chat header { position: sticky; top: 0; background: var(--surface); padding-bottom: 8px; z-index: 1; }
+  .panel--settings h2, .panel--chat h2 { font-size: 15px; }
+
+  .chat__log { max-height: 52dvh; }
+  .chat__form input, .chat__send { height: 46px; }
+  .chat__send { width: 46px; }
+  .bg-picker { gap: 8px; }
+  .bg { padding: 12px 4px; }
+  .field input[type="text"] { height: 46px; }
+
   .field select, .switch i { min-height: 44px; }
   .switch i { height: 26px; width: 44px; min-height: 0; }
   .switch i::after { width: 20px; height: 20px; }
