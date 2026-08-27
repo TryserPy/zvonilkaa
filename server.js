@@ -22,6 +22,39 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_PEERS_PER_ROOM = 2;
+
+/**
+ * Строгая политика содержимого: страница грузит только свои файлы и никуда
+ * не ходит, кроме собственного WebSocket. Встраивать её в чужой iframe
+ * нельзя — это закрывает подмену интерфейса поверх настоящего звонка.
+ */
+const CSP = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "img-src 'self' data:",
+  "media-src 'self' blob: mediastream:",
+  "connect-src 'self' ws: wss:",
+  "manifest-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
+
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': CSP,
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  // Камера, микрофон и захват экрана — только самой странице, всё прочее закрыто
+  'Permissions-Policy':
+    'camera=(self), microphone=(self), display-capture=(self), ' +
+    'geolocation=(), payment=(), usb=(), serial=(), midi=(), ' +
+    'accelerometer=(), gyroscope=(), magnetometer=(), browsing-topics=()',
+};
 const MAX_MESSAGE_BYTES = 96 * 1024; // SDP редко бывает больше 30 КБ
 const HEARTBEAT_MS = 25_000;
 
@@ -105,11 +138,10 @@ function sendAsset(req, res, filePath) {
   }
 
   const headers = {
+    ...SECURITY_HEADERS,
     'Content-Type': asset.type,
     ETag: asset.etag,
     Vary: 'Accept-Encoding',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
     // Всё отдаём с обязательной проверкой свежести. Раньше скрипты и стили
     // кэшировались на сутки, и после обновления браузер собирал франкенштейна
     // из новой разметки и старого кода — приложение падало на ровном месте.
@@ -141,6 +173,7 @@ function sendAsset(req, res, filePath) {
 function sendJson(res, code, data) {
   const body = Buffer.from(JSON.stringify(data));
   res.writeHead(code, {
+    ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': body.length,
     'Cache-Control': 'no-store',
@@ -247,12 +280,45 @@ function createServer() {
 
 const { server, secure } = createServer();
 
+// Строгий транспорт имеет смысл только когда сайт уже открыт по HTTPS
+if (secure) SECURITY_HEADERS['Strict-Transport-Security'] = 'max-age=31536000';
+
 /* ------------------------------------------------------------------ *
  * Сигнальный сервер (WebSocket)
  * ------------------------------------------------------------------ */
 
-/** @type {Map<string, Map<string, import('ws').WebSocket>>} */
+/** @type {Map<string, Map<string, import('./lib/ws').WebSocketConnection>>} */
 const rooms = new Map();
+
+/**
+ * Простая защита от наплыва: и на новые соединения, и на поток сообщений.
+ * Сигналингу нужны десятки сообщений на звонок, поэтому лимиты щедрые —
+ * они отсекают только явное злоупотребление.
+ */
+const CONNECT_LIMIT = 40;        // соединений с одного адреса за минуту
+const MESSAGE_LIMIT = 400;       // сообщений от одного соединения за минуту
+const LIMIT_WINDOW = 60_000;
+
+const connectCounts = new Map();
+
+function tooManyConnections(ip) {
+  const now = Date.now();
+  const entry = connectCounts.get(ip);
+  if (!entry || now - entry.since > LIMIT_WINDOW) {
+    connectCounts.set(ip, { since: now, count: 1 });
+    return false;
+  }
+  entry.count++;
+  return entry.count > CONNECT_LIMIT;
+}
+
+// Чистим счётчики, чтобы карта не росла бесконечно
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of connectCounts) {
+    if (now - entry.since > LIMIT_WINDOW) connectCounts.delete(ip);
+  }
+}, LIMIT_WINDOW).unref();
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_MESSAGE_BYTES });
 
@@ -273,10 +339,21 @@ function leaveRoom(ws) {
   ws.roomId = null;
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  ws.on('close', () => leaveRoom(ws));
+  ws.on('error', () => leaveRoom(ws));
+
+  const ip = req?.socket?.remoteAddress || 'unknown';
+  if (tooManyConnections(ip)) {
+    send(ws, 'error', { reason: 'rate-limit' });
+    return ws.close(1013, 'slow down');
+  }
+
   ws.peerId = crypto.randomUUID();
   ws.roomId = null;
   ws.isAlive = true;
+  ws.msgSince = Date.now();
+  ws.msgCount = 0;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
@@ -284,6 +361,13 @@ wss.on('connection', (ws) => {
   send(ws, 'welcome', { peerId: ws.peerId, iceServers: iceServers() });
 
   ws.on('message', (data) => {
+    const now = Date.now();
+    if (now - ws.msgSince > LIMIT_WINDOW) { ws.msgSince = now; ws.msgCount = 0; }
+    if (++ws.msgCount > MESSAGE_LIMIT) {
+      send(ws, 'error', { reason: 'rate-limit' });
+      return ws.close(1013, 'slow down');
+    }
+
     let msg;
     try {
       msg = JSON.parse(data);
@@ -338,8 +422,6 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => leaveRoom(ws));
-  ws.on('error', () => leaveRoom(ws));
 });
 
 // Отсекаем «мёртвые» соединения (мобильный браузер ушёл в фон и не закрылся).

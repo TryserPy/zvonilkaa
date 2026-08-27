@@ -104,7 +104,12 @@ button { cursor: pointer; background: none; border: 0; }
 @keyframes orbitspin { to { transform: rotate(360deg); } }
 @keyframes breathe { 0%, 100% { transform: scale(1); opacity: .55; } 50% { transform: scale(1.35); opacity: 1; } }
 
-.reveal { animation: reveal .6s var(--ease) both; animation-delay: var(--d, 0ms); }
+.reveal { animation: reveal .6s var(--ease) both; }
+.reveal--1 { animation-delay: 0ms; }
+.reveal--2 { animation-delay: 60ms; }
+.reveal--3 { animation-delay: 100ms; }
+.reveal--4 { animation-delay: 180ms; }
+.reveal--5 { animation-delay: 240ms; }
 
 /* ───────────────── Лобби ───────────────── */
 

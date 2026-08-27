@@ -22,6 +22,10 @@ const TILE_ORDER = ['remote-screen', 'remote-cam', 'local-screen', 'local-cam'];
 
 const S = {
   roomId: null,
+  roomKey: null,      // текстовый вид, идёт в ссылку
+  key: null,          // импортированный CryptoKey
+  keyWarned: false,
+  fatal: null,
   polite: false,
   peerId: null,
   peerPresent: false,
@@ -48,6 +52,7 @@ const S = {
   remoteKnown: false,
 
   lowLatency: false,
+  shareQuality: 'detail',
   shareAudio: true,
   mirror: true,
   noiseSuppress: true,
@@ -66,14 +71,37 @@ const S = {
 
   statsTimer: null,
   prev: null,
-  quality: 1,
+  quality: 2,
   qualityHold: 0,
+  voiceOnly: false,
+  voiceOnlySince: 0,
   wakeLock: null,
   fingerprint: null,
   inCall: false,
 };
 
+/** Как снимать и кодировать экран под разные задачи. */
+const SHARE_PRESETS = {
+  detail: {
+    label: 'чёткость',
+    hint: 'text',
+    fps: 30,
+    bitrate: 5_000_000,
+    degradation: 'maintain-resolution', // текст не должен мылиться
+    codecs: ['VP9', 'AV1', 'VP8'],
+  },
+  motion: {
+    label: 'плавность',
+    hint: 'motion',
+    fps: 60,
+    bitrate: 8_000_000,
+    degradation: 'maintain-framerate',
+    codecs: ['VP9', 'VP8'],
+  },
+};
+
 const LADDER = [
+  { bitrate: 4_000_000, fps: 30, label: 'максимальное' },
   { bitrate: 2_500_000, fps: 30, label: 'высокое' },
   { bitrate: 1_200_000, fps: 30, label: 'хорошее' },
   { bitrate: 600_000, fps: 25, label: 'среднее' },
@@ -102,13 +130,78 @@ function setInvite(visible) {
 
 function randomRoomId() {
   const abc = 'abcdefghijkmnpqrstuvwxyz23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(9));
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
   const s = [...bytes].map((b) => abc[b % abc.length]).join('');
-  return `${s.slice(0, 3)}-${s.slice(3, 6)}-${s.slice(6, 9)}`;
+  return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}`;
 }
 
 const fmtKbps = (bps) =>
   bps >= 1_000_000 ? (bps / 1_000_000).toFixed(1) + ' Мбит/с' : Math.round(bps / 1000) + ' кбит/с';
+
+/* ═══════════════════════════════════════════════════════════════════
+   КЛЮЧ КОМНАТЫ
+   ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * Ключ живёт в якоре ссылки (после #) и по правилам HTTP на сервер не
+ * отправляется. Им шифруется весь сигналинг: сервер видит только шифротекст
+ * и не может ни прочитать SDP, ни подменить отпечатки сертификатов, то есть
+ * встать посередине звонка у него не выйдет даже теоретически.
+ */
+
+const b64 = {
+  encode(bytes) {
+    let str = '';
+    for (const b of bytes) str += String.fromCharCode(b);
+    return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  },
+  decode(text) {
+    const padded = text.replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  },
+};
+
+const newRoomKey = () => b64.encode(crypto.getRandomValues(new Uint8Array(32)));
+
+async function importRoomKey(text) {
+  if (!text || !crypto.subtle) return null;
+  try {
+    const raw = b64.decode(text);
+    if (raw.length !== 32) return null;
+    return await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  } catch {
+    return null;
+  }
+}
+
+async function seal(key, value) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const body = new TextEncoder().encode(JSON.stringify(value));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, body));
+  const joined = new Uint8Array(iv.length + ct.length);
+  joined.set(iv);
+  joined.set(ct, iv.length);
+  return { e: b64.encode(joined) };
+}
+
+async function unseal(key, payload) {
+  const joined = b64.decode(payload.e);
+  const iv = joined.subarray(0, 12);
+  const ct = joined.subarray(12);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+/** Достаёт код комнаты и ключ из ссылки или из того, что вставили в поле. */
+function parseRoomLink(text) {
+  const raw = String(text || '').trim();
+  const hash = raw.match(/#k=([A-Za-z0-9_-]{40,64})/);
+  const withoutHash = raw.split('#')[0];
+  const id = (withoutHash.split(/[/?]/).filter(Boolean).pop() || '')
+    .replace(/[^A-Za-z0-9_-]/g, '');
+  return { id, key: hash ? hash[1] : null };
+}
 
 /* Настройки, которые стоит помнить между звонками */
 const prefs = {
@@ -595,9 +688,16 @@ async function startShare() {
   if (!navigator.mediaDevices?.getDisplayMedia) {
     return toast('Демонстрация экрана не поддерживается этим браузером');
   }
+
+  const preset = SHARE_PRESETS[S.shareQuality] || SHARE_PRESETS.detail;
+
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 30 } },
+      video: {
+        frameRate: { ideal: preset.fps, max: preset.fps },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
       audio: S.shareAudio
         ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
         : false,
@@ -608,7 +708,8 @@ async function startShare() {
 
     const video = stream.getVideoTracks()[0];
     const audio = stream.getAudioTracks()[0] || null;
-    try { video.contentHint = 'detail'; } catch {}
+    // Подсказка кодеку, что важнее: резкость мелкого текста или плавность
+    try { video.contentHint = preset.hint; } catch {}
     video.addEventListener('ended', stopShare);
 
     S.local.screen = video;
@@ -618,13 +719,47 @@ async function startShare() {
     if (audio && S.send.screenAudio) await S.send.screenAudio.replaceTrack(audio);
 
     tileVideo('local-screen').srcObject = stream;
+    preferScreenCodec();
     await applySendParams();
     S.mainLocked = false;
     refreshUi();
     sendState();
-    toast(audio ? 'Показываете экран со звуком' : 'Показываете экран');
+
+    const size = video.getSettings();
+    toast(
+      `Показываете экран: ${preset.label}` +
+        (size.width ? `, ${size.width}×${size.height}` : '') +
+        (size.frameRate ? `, ${Math.round(size.frameRate)} к/с` : '') +
+        (audio ? ', со звуком' : '')
+    );
   } catch {
     /* пользователь закрыл выбор окна */
+  }
+}
+
+/**
+ * VP9 заметно лучше VP8 держит мелкий текст на том же битрейте, а AV1 ещё
+ * экономнее, но тяжелее для процессора. Ставим их вперёд только для дорожки
+ * экрана — камере это ни к чему.
+ */
+function preferScreenCodec() {
+  const transceiver = S.pc?.getTransceivers?.()[2];
+  if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+
+  try {
+    const supported = RTCRtpSender.getCapabilities?.('video')?.codecs;
+    if (!supported) return;
+
+    const wanted = (SHARE_PRESETS[S.shareQuality] || SHARE_PRESETS.detail).codecs;
+    const rank = (codec) => {
+      const name = codec.mimeType.split('/')[1].toUpperCase();
+      const i = wanted.indexOf(name);
+      return i === -1 ? wanted.length : i;
+    };
+    const ordered = [...supported].sort((a, b) => rank(a) - rank(b));
+    transceiver.setCodecPreferences(ordered);
+  } catch {
+    /* браузер не даёт выбирать кодек — работаем с тем, что есть */
   }
 }
 
@@ -816,10 +951,11 @@ function connectSignaling() {
     ws.send(JSON.stringify({ type: 'join', roomId: S.roomId }));
   });
 
+  let recvChain = Promise.resolve();
   ws.addEventListener('message', (e) => {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
-    handleSignal(m);
+    recvChain = recvChain.then(() => handleSignal(m)).catch((err) => console.warn('signal:', err));
   });
 
   ws.addEventListener('close', () => {
@@ -830,8 +966,19 @@ function connectSignaling() {
   });
 }
 
+// Шифрование асинхронное, поэтому сообщения выстраиваем в очередь:
+// перепутанный порядок SDP и кандидатов ломает соединение.
+let sendChain = Promise.resolve();
+
 function signal(data) {
-  if (S.ws?.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify({ type: 'signal', data }));
+  sendChain = sendChain
+    .then(async () => {
+      const payload = S.key ? await seal(S.key, data) : data;
+      if (S.ws?.readyState === WebSocket.OPEN) {
+        S.ws.send(JSON.stringify({ type: 'signal', data: payload }));
+      }
+    })
+    .catch((err) => console.warn('signal:', err));
 }
 
 function sendState() {
@@ -882,8 +1029,29 @@ async function handleSignal(m) {
   }
 }
 
-async function onRemoteSignal(data) {
-  if (!data) return;
+function keyMismatch() {
+  if (S.keyWarned) return;
+  S.keyWarned = true;
+  S.fatal = 'Ссылки не совпадают';
+  setStatus('bad', S.fatal);
+  toast('У вас и у собеседника разные ссылки на комнату. Откройте ту, что была отправлена целиком, вместе с частью после решётки.', 8000);
+}
+
+async function onRemoteSignal(payload) {
+  if (!payload) return;
+
+  let data = payload;
+  if (payload.e) {
+    if (!S.key) return keyMismatch();
+    try {
+      data = await unseal(S.key, payload);
+    } catch {
+      return keyMismatch();
+    }
+  } else if (S.key) {
+    // Мы в защищённой комнате, а собеседник прислал открытый текст
+    return keyMismatch();
+  }
 
   if (data.state) {
     S.remoteState = { ...S.remoteState, ...data.state };
@@ -979,6 +1147,7 @@ async function bindRoles() {
       try { await t.sender.replaceTrack(track); } catch {}
     }
   }
+  preferScreenCodec();
 }
 
 async function startPeerConnection() {
@@ -1020,6 +1189,7 @@ async function startPeerConnection() {
       })
     );
     ROLES.forEach((role, i) => (S.send[role] = transceivers[i].sender));
+    preferScreenCodec();
     await bindRoles();
   }
 
@@ -1087,17 +1257,24 @@ async function applySendParams() {
   const step = LADDER[S.quality];
   await tune(S.send.cam, {
     encoding: {
-      maxBitrate: step.bitrate,
-      maxFramerate: step.fps,
+      active: !S.voiceOnly,
+      maxBitrate: S.voiceOnly ? 60_000 : step.bitrate,
+      maxFramerate: S.voiceOnly ? 5 : step.fps,
       scaleResolutionDownBy: 1,
       networkPriority: S.sharing ? 'low' : 'medium',
     },
     degradation: 'balanced',
   });
 
+  const preset = SHARE_PRESETS[S.shareQuality] || SHARE_PRESETS.detail;
   await tune(S.send.screen, {
-    encoding: { maxBitrate: 3_000_000, maxFramerate: 30, scaleResolutionDownBy: 1, networkPriority: 'high' },
-    degradation: 'maintain-resolution', // текст должен оставаться читаемым
+    encoding: {
+      maxBitrate: preset.bitrate,
+      maxFramerate: preset.fps,
+      scaleResolutionDownBy: 1,
+      networkPriority: 'high',
+    },
+    degradation: preset.degradation,
   });
 }
 
@@ -1151,6 +1328,9 @@ function setStatus(kind, text) {
  * потому что connectionState не менялся и событие не приходило.
  */
 function syncStatus() {
+  // Несовпадение ключей чинится только новой ссылкой — не затираем сообщение
+  if (S.fatal) return setStatus('bad', S.fatal);
+
   const pc = S.pc;
   if (!pc) return;
   if (!S.peerPresent) return setStatus('connecting', 'Ждём собеседника');
@@ -1190,6 +1370,7 @@ async function collectStats() {
     audioIn: 0, audioOut: 0, videoInFrames: 0,
     width: 0, height: 0, fps: 0,
     codec: null, route: null, srtp: null, dtls: null,
+    localAddr: null, proto: null, relayProto: null, localType: null, remoteType: null,
     localFp: null, remoteFp: null,
     packetsLost: 0, packetsRecv: 0,
     bufferDelay: 0, bufferCount: 0,
@@ -1204,6 +1385,11 @@ async function collectStats() {
       const local = byId.get(r.localCandidateId);
       const remote = byId.get(r.remoteCandidateId);
       if (local && remote) {
+        acc.localType = local.candidateType;
+        acc.remoteType = remote.candidateType;
+        acc.localAddr = local.address || local.ip || null;
+        acc.proto = local.protocol || null;
+        acc.relayProto = local.relayProtocol || null;
         acc.route =
           local.candidateType === 'relay' || remote.candidateType === 'relay'
             ? 'через TURN-сервер'
@@ -1344,13 +1530,49 @@ function renderPing(rtt) {
   el.className = ms < 80 ? 'is-good' : ms < 200 ? 'is-mid' : 'is-bad';
 }
 
+/**
+ * Вниз опускаемся сразу, вверх — только после долгой спокойной сети.
+ * Когда даже нижняя ступень не спасает, жертвуем видео ради голоса:
+ * лучше слышать собеседника, чем смотреть на замерший кадр.
+ */
 function adaptQuality(rtt, loss) {
   if (rtt == null) return;
+
+  const awful = loss > 12;
   const bad = loss > 4 || rtt > 350;
-  const good = loss < 1 && rtt < 180;
+  const good = loss < 1.5 && rtt < 180;
+
+  if (S.voiceOnly) {
+    // Возвращаем видео только после десяти секунд спокойной сети
+    if (loss < 3) {
+      if (++S.qualityHold >= 10) {
+        S.voiceOnly = false;
+        S.qualityHold = 0;
+        applySendParams();
+        toast('Сеть выправилась — видео снова включено', 2600);
+      }
+    } else {
+      S.qualityHold = 0;
+    }
+    return;
+  }
+
+  if (awful && S.quality >= LADDER.length - 1) {
+    if (++S.voiceOnlySince >= 3) {
+      S.voiceOnly = true;
+      S.voiceOnlySince = 0;
+      S.qualityHold = 0;
+      applySendParams();
+      toast('Сеть не тянет видео — оставляю только голос', 3200);
+    }
+    return;
+  }
+  if (!awful) S.voiceOnlySince = 0;
 
   if (bad && S.quality < LADDER.length - 1) {
-    S.quality++; S.qualityHold = 0; applySendParams();
+    S.quality++;
+    S.qualityHold = 0;
+    applySendParams();
   } else if (good && S.quality > 0) {
     if (++S.qualityHold >= 12) { S.quality--; S.qualityHold = 0; applySendParams(); }
   } else {
@@ -1359,7 +1581,7 @@ function adaptQuality(rtt, loss) {
 }
 
 async function renderSecurity(acc) {
-  if (acc.dtls) $('lockText').textContent = 'Зашифровано';
+  if (acc.dtls) $('lockText').textContent = S.key ? 'Защищено ключом' : 'Зашифровано';
   if (S.fingerprint || !acc.localFp || !acc.remoteFp || !crypto.subtle) return;
   try {
     const joined = [acc.localFp, acc.remoteFp].sort().join('|');
@@ -1389,21 +1611,51 @@ function renderStatsPanel(acc, inBps, outBps, loss) {
   // Ощущаемая задержка: полпути по сети плюс буфер приёма
   const mouthToEar = acc.rtt != null && acc.buffer != null ? Math.round(acc.rtt / 2 + acc.buffer) : null;
   cells.push(`<div class="stat stat--wide"><span>Задержка звука</span><b>${mouthToEar == null ? '—' : mouthToEar + ' мс'}</b></div>`);
-  cells.push(`<div class="stat stat--wide"><span>Маршрут</span><b>${acc.route || '—'}</b></div>`);
+  const path = [acc.route || '—', acc.proto ? acc.proto.toUpperCase() : null, acc.relayProto ? 'через ' + acc.relayProto.toUpperCase() : null]
+    .filter(Boolean)
+    .join(', ');
+  cells.push(`<div class="stat stat--wide"><span>Маршрут</span><b>${path}</b></div>`);
+  cells.push(`<div class="stat stat--wide"><span>Ваш адрес в соединении</span><b>${acc.localAddr || '—'}</b></div>`);
   cells.push(`<div class="stat stat--wide"><span>Шифрование</span><b>${acc.srtp || acc.dtls || 'DTLS-SRTP'}</b></div>`);
   $('statsGrid').innerHTML = cells.join('');
 
   const parts = [`Отправка: <b>${LADDER[S.quality].label}</b>, подстраивается автоматически.`];
   if (acc.codec) parts.push(`Кодек: <b>${acc.codec}</b>.`);
   if (S.fingerprint) parts.push(`Код безопасности: <b>${S.fingerprint}</b> — должен совпадать у обоих.`);
-  if (acc.rtt != null && acc.rtt > 150) {
-    parts.push(
-      acc.route === 'через TURN-сервер'
-        ? 'Высокий пинг из-за ретранслятора: трафик идёт через TURN, а не напрямую.'
-        : 'Высокий пинг задан маршрутом до собеседника. Помогают провод вместо Wi-Fi и отключение VPN.'
-    );
-  }
+  if (S.key) parts.push('Сигналинг зашифрован ключом из ссылки — сервер видит только шифротекст.');
+  if (S.voiceOnly) parts.push('<b>Сеть не тянет видео</b> — временно оставлен только голос.');
+
+  for (const line of diagnose(acc)) parts.push(line);
   $('statsNote').innerHTML = parts.join('<br>');
+}
+
+/**
+ * Понятным языком о том, что видно в статистике. Отдельно про VPN: сам факт
+ * туннеля браузеру не виден, но его выдают косвенные признаки — соединение
+ * по TCP, ретранслятор и адрес из служебных диапазонов.
+ */
+function diagnose(acc) {
+  const out = [];
+  const addr = acc.localAddr || '';
+  const vpnish =
+    /^(25|26)\./.test(addr) ||                       // Hamachi, Radmin VPN
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(addr) || // CGNAT и Tailscale
+    /^198\.1[89]\./.test(addr) ||
+    /^fd/i.test(addr);
+
+  if (acc.proto === 'tcp' || acc.relayProto === 'tcp') {
+    out.push('Соединение идёт по <b>TCP</b>. Обычно это значит, что UDP режет VPN или фаервол — задержка и рывки от этого заметно хуже.');
+  }
+  if (acc.route === 'через TURN-сервер') {
+    out.push('Трафик идёт через ретранслятор, а не напрямую — это всегда дороже по задержке.');
+  }
+  if (vpnish) {
+    out.push(`Адрес <b>${addr}</b> похож на VPN или виртуальную сеть. Если звонок не через неё, отключите VPN — станет заметно лучше.`);
+  }
+  if (acc.rtt != null && acc.rtt > 150 && !out.length) {
+    out.push('Высокий пинг задан маршрутом до собеседника. Помогают провод вместо Wi-Fi и отключение VPN.');
+  }
+  return out;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1424,6 +1676,7 @@ function togglePanel(id, btnId) {
 $('statsBtn').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
 $('pingPill').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
 $('statsClose').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
+$('lockPill').addEventListener('click', () => togglePanel('statsPanel', 'statsBtn'));
 $('settingsBtn').addEventListener('click', () => { listDevices(); togglePanel('settingsPanel', 'settingsBtn'); });
 $('settingsClose').addEventListener('click', () => togglePanel('settingsPanel', 'settingsBtn'));
 
@@ -1449,21 +1702,47 @@ bindSwitch('noiseSuppress', 'noiseSuppress', () => applyAudioProcessing(true));
 bindSwitch('echoCancel', 'echoCancel', () => applyAudioProcessing(true));
 bindSwitch('autoGain', 'autoGain', () => applyAudioProcessing(true));
 
+$('shareQuality').value = prefs.get('shareQuality', 'detail');
+S.shareQuality = $('shareQuality').value;
+$('shareQuality').addEventListener('change', async (e) => {
+  S.shareQuality = e.target.value;
+  prefs.set('shareQuality', S.shareQuality);
+  if (!S.sharing) return toast('Применится при следующей демонстрации', 2000);
+
+  // На лету меняем частоту кадров и подсказку кодеку, не пересоздавая захват
+  const preset = SHARE_PRESETS[S.shareQuality];
+  try { S.local.screen.contentHint = preset.hint; } catch {}
+  try { await S.local.screen.applyConstraints({ frameRate: { ideal: preset.fps, max: preset.fps } }); } catch {}
+  preferScreenCodec();
+  await applySendParams();
+  toast(`Демонстрация: ${preset.label}`, 2000);
+});
+
 $('reconnectBtn').addEventListener('click', () => reconnect());
 $('buildStamp').textContent = 'Сборка от ' + BUILD;
 
 /* ─────────────── Экраны ─────────────── */
 
-async function enterCall(roomId) {
+async function enterCall(roomId, roomKey = null) {
   S.roomId = roomId;
+  S.roomKey = roomKey;
+  S.key = await importRoomKey(roomKey);
+  S.keyWarned = false;
+  S.fatal = null;
   S.inCall = true;
   S.fingerprint = null;
 
-  history.replaceState({ room: roomId }, '', '/' + roomId);
+  const suffix = S.key ? '#k=' + roomKey : '';
+  history.replaceState({ room: roomId }, '', '/' + roomId + suffix);
   document.title = `Звонок ${roomId} · Звонилка`;
 
+  $('lockText').textContent = S.key ? 'Защищено ключом' : 'Шифруется';
+  $('lockPill').title = S.key
+    ? 'Сигналинг зашифрован ключом из ссылки, сервер видит только шифротекст'
+    : 'Медиапоток зашифрован, но ключа комнаты в ссылке нет';
+
   $('remoteAvatar').textContent = roomId[0].toUpperCase();
-  $('inviteLink').value = location.origin + '/' + roomId;
+  $('inviteLink').value = location.origin + '/' + roomId + suffix;
   $('shareBtn').hidden = !navigator.share;
   $('stageEmptyText').textContent = 'Ожидание собеседника…';
   setInvite(false);
@@ -1494,7 +1773,9 @@ function endCall(title = 'Звонок завершён', text = 'Спасибо
   S.sharing = false;
   S.peerPresent = false;
   S.prev = null;
-  S.quality = 0;
+  S.quality = 2;
+  S.voiceOnly = false;
+  S.voiceOnlySince = 0;
   S.main = null;
   S.mainLocked = false;
   stopFrameWatch();
@@ -1517,18 +1798,19 @@ function goHome() {
   show('lobby');
 }
 
-$('createBtn').addEventListener('click', () => enterCall(randomRoomId()));
+$('createBtn').addEventListener('click', () => enterCall(randomRoomId(), newRoomKey()));
 
 $('joinForm').addEventListener('submit', (e) => {
   e.preventDefault();
-  const raw = $('roomInput').value.trim();
-  const id = (raw.split('/').pop() || '').replace(/[^A-Za-z0-9_-]/g, '');
+  const { id, key } = parseRoomLink($('roomInput').value);
   if (id.length < 3) return toast('Введите код комнаты или ссылку');
-  enterCall(id);
+  if (!key) toast('В ссылке нет ключа комнаты — собеседник должен открыть такую же ссылку', 5000);
+  enterCall(id, key);
 });
 
 $('hangupBtn').addEventListener('click', () => endCall());
-$('rejoinBtn').addEventListener('click', () => enterCall(S.roomId || randomRoomId()));
+$('rejoinBtn').addEventListener('click', () =>
+  enterCall(S.roomId || randomRoomId(), S.roomKey || newRoomKey()));
 $('homeBtn').addEventListener('click', goHome);
 
 $('copyBtn').addEventListener('click', async () => {
@@ -1637,16 +1919,18 @@ function beep(freq) {
   } catch {}
 }
 
-/* Точка для отладки из консоли браузера */
+/* Точка для отладки из консоли браузера и для автотестов */
 window.__zv = S;
+window.__zvDebug = { adaptQuality, applySendParams, reconnect, diagnose, LADDER, SHARE_PRESETS };
 
 /* ─────────────── Старт ─────────────── */
 
 (function boot() {
   const path = location.pathname.replace(/^\/|\/$/g, '');
+  const key = (location.hash.match(/^#k=([A-Za-z0-9_-]{40,64})$/) || [])[1] || null;
   if (/^[A-Za-z0-9_-]{3,64}$/.test(path)) {
     $('roomInput').value = path;
-    enterCall(path);
+    enterCall(path, key);
   } else {
     show('lobby');
     ensureMedia();

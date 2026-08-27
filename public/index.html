@@ -30,14 +30,14 @@
 
   <div class="lobby__body">
     <div class="lobby__intro">
-      <div class="pill pill--quiet reveal" style="--d:0ms">
+      <div class="pill pill--quiet reveal reveal--1">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>
         Сквозное шифрование DTLS-SRTP
       </div>
-      <h1 class="reveal" style="--d:60ms">Звонок начинается<br>с одной ссылки</h1>
-      <p class="muted reveal" style="--d:120ms">Видео и звук идут напрямую между устройствами. Сервер не может ни услышать, ни записать разговор.</p>
+      <h1 class="reveal reveal--2">Звонок начинается<br>с одной ссылки</h1>
+      <p class="muted reveal reveal--3">Видео и звук идут напрямую между устройствами. Сервер не может ни услышать, ни записать разговор.</p>
 
-      <div class="actions reveal" style="--d:180ms">
+      <div class="actions reveal reveal--4">
         <button class="btn btn--primary" id="createBtn" type="button">Создать звонок</button>
         <form class="join" id="joinForm" autocomplete="off">
           <input id="roomInput" type="text" inputmode="latin" placeholder="Код комнаты" aria-label="Код комнаты" maxlength="64" spellcheck="false">
@@ -46,7 +46,7 @@
       </div>
     </div>
 
-    <aside class="lobby__preview reveal" style="--d:100ms">
+    <aside class="lobby__preview reveal reveal--3">
       <div class="preview" id="preview">
         <video id="previewVideo" playsinline autoplay muted></video>
         <div class="preview__off">
@@ -61,7 +61,7 @@
       </div>
     </aside>
 
-    <ul class="features reveal" style="--d:240ms">
+    <ul class="features reveal reveal--5">
       <li><b>Вместе</b>Камера и демонстрация экрана одновременно</li>
       <li><b>Пинг</b>Задержка и качество канала в реальном времени</li>
       <li><b>P2P</b>Прямое соединение, минимум задержки</li>
@@ -122,10 +122,10 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l4-6 4 3 4-8 6 11"/></svg>
       <span id="pingText">— мс</span>
     </button>
-    <div class="pill pill--lock" title="Медиапоток зашифрован">
+    <button class="pill pill--lock pill--btn" id="lockPill" type="button" title="Как защищён этот звонок">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>
       <span id="lockText">Шифруется</span>
-    </div>
+    </button>
   </div>
 
   <!-- Браузер блокирует автовоспроизведение звука, пока по странице не кликнули -->
@@ -216,6 +216,14 @@
       <input type="checkbox" id="lowLatency">      <i></i>
       <span>Низкая задержка<em>Меньше буфер приёма — звук идёт быстрее, но хуже переносит рывки сети</em></span>
     </label>
+    <label class="field">
+      <span>Качество демонстрации</span>
+      <select id="shareQuality">
+        <option value="detail">Чёткость — текст и код</option>
+        <option value="motion">Плавность — видео и игры, до 60 к/с</option>
+      </select>
+    </label>
+
     <label class="switch">
       <input type="checkbox" id="shareAudio" checked>
       <i></i>
